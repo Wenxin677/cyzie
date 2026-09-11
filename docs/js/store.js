@@ -7,8 +7,19 @@ const HISTORY = 'history';
 const SETTINGS_KEY = 'cyzie:settings';
 
 let dbPromise = null;
+let storageDisabled = false;
+
+/** Used by tests, and by the app when the browser blocks storage (private windows). */
+export function disableStorage(reason = 'storage unavailable') {
+  storageDisabled = true;
+  dbPromise = Promise.reject(new Error(reason));
+  dbPromise.catch(() => {});
+}
+
+export function storageAvailable() { return !storageDisabled; }
 
 export function openDb() {
+  if (storageDisabled) return Promise.reject(new Error('storage unavailable'));
   if (dbPromise) return dbPromise;
   dbPromise = new Promise((resolve, reject) => {
     if (typeof indexedDB === 'undefined') { reject(new Error('IndexedDB unavailable')); return; }
@@ -49,12 +60,16 @@ export function serializeDeck(deck, session) {
     deckTitle: deck.deckTitle,
     kind: deck.kind,
     stats: deck.stats,
+    roadmap: deck.roadmap || [],
+    objectives: deck.objectives || [],
+    map: deck.map || null,
     slides: deck.slides.map(s => ({
       index: s.index, title: s.title, fullTitle: s.fullTitle, rawTitle: s.rawTitle,
       lines: s.lines, notes: s.notes, text: s.text, bodyText: s.bodyText,
       terms: s.terms, facts: s.facts, numbers: s.numbers, lists: s.lists,
       topics: s.topics, titleWords: s.titleWords, source: s.source,
       width: s.width, height: s.height, codeHeavy: s.codeHeavy, skipQuestions: s.skipQuestions,
+      role: s.role, roleWhy: s.roleWhy, code: s.code || null,
     })),
     glossary: [...deck.glossary.entries()],
   };
@@ -65,6 +80,9 @@ export function reviveDeck(saved) {
     deckTitle: saved.deckTitle,
     kind: saved.kind,
     stats: saved.stats,
+    roadmap: saved.roadmap || [],
+    objectives: saved.objectives || [],
+    map: saved.map || null,
     slides: saved.slides,
     glossary: new Map(saved.glossary || []),
   };

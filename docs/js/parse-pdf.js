@@ -179,21 +179,60 @@ export async function parsePdf(buffer, { onProgress } = {}) {
   return { kind: 'pdf', slides };
 }
 
-/** Render one PDF page to a data URL (used by the slide preview panel). */
-export async function renderPdfPage(buffer, pageNumber, { scale = 1.4 } = {}) {
+/* ---------------------------------------------------- document cache ----- */
+
+/* Re-parsing the whole PDF for every page is slow and memory-hungry, so one document
+   instance is kept per lesson and reused for every page render. */
+const openDocuments = new Map();   // key → Promise<pdfjs document>
+const MAX_OPEN_DOCUMENTS = 3;
+
+async function documentFor(key, buffer) {
+  if (key && openDocuments.has(key)) return openDocuments.get(key);
   const pdfjs = await pdfjsLib();
-  const data = copiesOf(buffer);
-  const doc = await pdfjs.getDocument({ data, isEvalSupported: false }).promise;
-  try {
-    const page = await doc.getPage(pageNumber);
-    const viewport = page.getViewport({ scale });
-    const canvas = document.createElement('canvas');
-    canvas.width = Math.ceil(viewport.width);
-    canvas.height = Math.ceil(viewport.height);
-    const ctx = canvas.getContext('2d');
-    await page.render({ canvasContext: ctx, viewport }).promise;
-    return canvas.toDataURL('image/jpeg', 0.82);
-  } finally {
-    try { await doc.destroy(); } catch { /* ignore */ }
+  // disableFontFace + useSystemFonts keep pdf.js from fetching font data at all: rendering
+  // must never depend on a network request (Cyzie's own CSP forbids them).
+  const promise = pdfjs.getDocument({
+    data: copiesOf(buffer),
+    isEvalSupported: false,
+    disableFontFace: true,
+    useSystemFonts: false,
+  }).promise;
+  if (!key) return promise;
+  openDocuments.set(key, promise);
+  if (openDocuments.size > MAX_OPEN_DOCUMENTS) {
+    const oldest = openDocuments.keys().next().value;
+    if (oldest !== key) {
+      const stale = openDocuments.get(oldest);
+      openDocuments.delete(oldest);
+      stale?.then(d => d.destroy?.()).catch(() => {});
+    }
   }
+  promise.catch(() => openDocuments.delete(key));
+  return promise;
+}
+
+export function closePdfDocument(key) {
+  const doc = openDocuments.get(key);
+  if (!doc) return;
+  openDocuments.delete(key);
+  doc.then(d => d.destroy?.()).catch(() => {});
+}
+
+/** Render one PDF page to a data URL (used by the slide preview panel and the chat).
+ *  @param {{scale?:number, key?:string, maxWidth?:number}} opts */
+export async function renderPdfPage(buffer, pageNumber, { scale = 1.4, key = null, maxWidth = 0 } = {}) {
+  const doc = await documentFor(key, buffer);
+  const page = await doc.getPage(pageNumber);
+  let fit = scale;
+  if (maxWidth) {
+    const base = page.getViewport({ scale: 1 });
+    if (base.width * scale > maxWidth) fit = maxWidth / base.width;
+  }
+  const viewport = page.getViewport({ scale: fit });
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.ceil(viewport.width));
+  canvas.height = Math.max(1, Math.ceil(viewport.height));
+  const ctx = canvas.getContext('2d', { alpha: false });
+  await page.render({ canvasContext: ctx, viewport }).promise;
+  return canvas.toDataURL('image/jpeg', 0.82);
 }

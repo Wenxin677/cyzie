@@ -8,7 +8,7 @@ import { parsePptx, parseDocx, scanOoxml, xmlTokens } from '../../docs/js/parse-
 import { parsePdf, configurePdfjs } from '../../docs/js/parse-pdf.js';
 import { parseText } from '../../docs/js/parse-text.js';
 import { analyzeDeck, lookupTerm, looksLikeCode } from '../../docs/js/extract.js';
-import { buildQuestions, buildLessonPlan, cleanDefinition } from '../../docs/js/questions.js';
+import { buildQuestions, buildLessonPlan, cleanDefinition, validChoices, shapeSimilarity } from '../../docs/js/questions.js';
 import { gradeAnswer } from '../../docs/js/grade.js';
 import { buildIndex, search, answerQuestion, rankSlides } from '../../docs/js/retrieve.js';
 import { createSession, start, respond, classify } from '../../docs/js/tutor.js';
@@ -82,7 +82,8 @@ for (const arg of process.argv.slice(2)) {
   const ext = (arg.split('.').pop() || '').toLowerCase();
   const parsed = ext === 'pdf' ? await parsePdf(new Uint8Array(buf))
     : ext === 'docx' ? await parseDocx(ab)
-      : await parsePptx(ab);
+      : (ext === 'md' || ext === 'txt' || ext === 'markdown') ? parseText(new TextDecoder().decode(buf))
+        : await parsePptx(ab);
   const deck = analyzeDeck(parsed);
   decks.push({ file: arg, deck });
   const label = arg.split(/[\\/]/).pop();
@@ -119,8 +120,9 @@ for (const deck of sampleDecks) {
         check(`qgen s${slide.index} ${q.id}: at least three options`, q.choices.length >= 3, `${q.choices.length}`);
         const texts = q.choices.map(c => c.text.toLowerCase());
         check(`qgen s${slide.index} ${q.id}: options are distinct`, new Set(texts).size === texts.length);
-        const dupe = q.choices.some(c => similarity(c.text, correct[0]?.text || '') > 0.75 && !c.correct);
-        check(`qgen s${slide.index} ${q.id}: distractors differ from the answer`, !dupe);
+        check(`qgen s${slide.index} ${q.id}: options pass the distinctness contract`, validChoices(q));
+        const dupe = q.choices.some(c => !c.correct && shapeSimilarity(c.text, correct[0]?.text || '') > 0.8 && Math.abs(c.text.length - (correct[0]?.text.length || 0)) < 12);
+        check(`qgen s${slide.index} ${q.id}: no near-twin options`, !dupe, q.choices.map(c => c.text.slice(0, 40)).join(' | '));
       }
       if (q.type === 'cloze_mcq' || q.type === 'cloze_type') {
         check(`qgen s${slide.index} ${q.id}: blank in prompt`, q.prompt.includes('______'), q.prompt.slice(0, 80));
@@ -198,8 +200,10 @@ for (const deck of sampleDecks) {
     const r = answerQuestion(deck, index, `what is ${defined.term}?`, { lookupTerm: x => lookupTerm(deck.glossary, x) });
     check(`retrieval: "what is ${defined.term}?" resolves`, r.kind === 'term' && r.term.term === defined.term, r.kind);
   }
-  const searchHits = search(index, deck.deckTitle.split(' ').slice(0, 3).join(' '), { limit: 3 });
-  check('retrieval: deck title search returns hits', searchHits.length > 0);
+  // Use real words from the title — "CS 101 -" tokenises to nothing and would fail spuriously.
+  const titleWords = deck.deckTitle.split(/\s+/).filter(w => /^[a-z]{3,}$/i.test(w)).slice(0, 2).join(' ');
+  const searchHits = titleWords ? search(index, titleWords, { limit: 3 }) : [];
+  check('retrieval: deck title search returns hits', !titleWords || searchHits.length > 0, `query "${titleWords}"`);
 }
 
 /* ------------------------------------------------------------ 9. tutor ---- */
@@ -275,7 +279,70 @@ for (const deck of sampleDecks.slice(0, 2)) {
   }
 }
 
-/* ---------------------------------------------------------- 10. session ---- */
+/* --------------------------------------------------- 11. coding decks ---- */
+section('coding decks');
+for (const [file, expectLang] of [['docs/tests/fixtures/code-java.md', 'java'], ['docs/tests/fixtures/code-python.md', 'python']]) {
+  const text = await readFile(file, 'utf8');
+  const deck = analyzeDeck(parseText(text));
+  const label = file.split('/').pop();
+  const codeSlides = deck.slides.filter(s => s.code?.blocks?.length);
+  check(`${label}: code blocks found`, codeSlides.length >= 2, `${codeSlides.length} slides with code`);
+  check(`${label}: language detected`, deck.stats.languages.includes(expectLang), JSON.stringify(deck.stats.languages));
+  check(`${label}: code slides are teachable`, codeSlides.every(s => !s.skipQuestions), codeSlides.map(s => `${s.index}:${s.skipQuestions}`).join(' '));
+  if (expectLang === 'java') {
+    check('code-java.md: agenda noticed', deck.slides.some(s => s.role === 'agenda') && deck.stats.roadmap > 0, JSON.stringify(deck.stats.roles));
+  } else {
+    check('code-python.md: plain deck needs no agenda', deck.stats.roadmap === 0, JSON.stringify(deck.stats.roles));
+  }
+
+  const simSlide = codeSlides.find(s => s.code.output);
+  if (expectLang === 'java') {
+    check('java: loop output simulated', !!simSlide, simSlide ? simSlide.code.output.summary : 'none');
+    check('java: simulated output matches the slide', simSlide?.code.output.summary === 'Pass 0 Pass 1 Pass 2 Pass 3 Pass 4', simSlide?.code.output.summary);
+  } else {
+    check('python: range loop simulated', simSlide?.code.output.summary === '1 2 3', simSlide?.code.output.summary);
+  }
+  check(`${label}: a slide states its own output`, codeSlides.some(s => s.code.stated.length > 0), `${codeSlides.filter(s => s.code.stated.length).length} slides with a stated output`);
+
+  const allQs = codeSlides.flatMap(s => buildQuestions(deck, s, { count: 7, seed: 'code' }));
+  const codeQs = allQs.filter(q => q.type.startsWith('code_') || q.type === 'line_meaning');
+  check(`${label}: code questions generated`, codeQs.length >= 6, `${codeQs.length} of ${allQs.length}`);
+  check(`${label}: several code question types`, new Set(codeQs.map(q => q.type)).size >= 3, [...new Set(codeQs.map(q => q.type))].join(','));
+  // Write-from-memory questions deliberately show no code; everything else quotes the block.
+  const quoting = codeQs.filter(q => q.type !== 'code_recall');
+  check(`${label}: code prompts include the code block`, quoting.every(q => q.prompt.includes('```') || !!q.codeContext), quoting.find(q => !q.prompt.includes('```') && !q.codeContext)?.type);
+  check(`${label}: recall questions come without the answer shown`, codeQs.filter(q => q.type === 'code_recall').every(q => !q.prompt.includes('```')));
+  check(`${label}: every code question has an answer`, codeQs.every(q => q.answer && q.answer.text));
+  check(`${label}: options stay distinct in code questions`, codeQs.every(q => validChoices(q)));
+
+  // A student answering from the key must score correct for every type.
+  for (const q of codeQs) {
+    const graded = gradeAnswer(q, q.answer.text);
+    check(`${label}: ${q.type} self-grade`, graded.verdict === 'correct', `${graded.verdict} :: ${q.answer.text.slice(0, 60)}`);
+  }
+  // And wrong answers must not be marked right.
+  for (const q of codeQs.filter(x => x.choices)) {
+    const wrong = q.choices.find(c => !c.correct);
+    const graded = gradeAnswer(q, wrong.text);
+    check(`${label}: ${q.type} rejects a distractor`, graded.verdict !== 'correct', `${graded.verdict} :: ${wrong.text.slice(0, 50)}`);
+  }
+
+  // A deck with structure should produce a roadmap and objectives.
+  const structured = analyzeDeck(parseText(`# Course\n\n## Learning Outcomes\n\n- Write a while loop that ends\n- Trace a for loop over a list\n\n## Contents\n\n- While loops\n- For loops\n\n## While Loops\n\nA while loop repeats while its condition is true.\n\n## For Loops\n\nA for loop repeats a counted number of times.\n\n## Thank You\n\nAny questions?\n`));
+  check('structure: agenda detected', structured.slides.some(s => s.role === 'agenda'), JSON.stringify(structured.stats.roles));
+  check('structure: objectives detected', structured.slides.some(s => s.role === 'objectives'), JSON.stringify(structured.stats.roles));
+  check('structure: closing slide detected', structured.slides.some(s => s.role === 'thanks'), JSON.stringify(structured.stats.roles));
+  check('structure: roadmap built from the agenda', structured.roadmap.length >= 2, JSON.stringify(structured.roadmap.map(t => t.label)));
+  check('structure: objectives captured', structured.objectives.length >= 2, JSON.stringify(structured.objectives.map(o => o.text)));
+  check('structure: roadmap maps topics to slides', structured.roadmap.some(t => t.slides.length > 0), JSON.stringify(structured.roadmap.map(t => t.slides)));
+  check('structure: non-content slides are not quizzed', structured.slides.filter(s => ['agenda', 'objectives', 'thanks'].includes(s.role)).every(s => s.skipQuestions));
+  const structSession = createSession(structured, { seed: 'structure' });
+  start(structSession);
+  const structSummary = respond(structSession, 'summary');
+  check('structure: opening message names the deck', structSummary.messages[0].text.length > 10);
+}
+
+/* ---------------------------------------------------------- 12. session ---- */
 section('session persistence shape');
 const deckForSave = sampleDecks[0];
 const s3 = createSession(deckForSave, { seed: 'save' });

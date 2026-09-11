@@ -1,15 +1,18 @@
 /* Cyzie — app controller: files in, lesson out, chat in the middle. */
 
 import { parsePptx, parseDocx } from './parse-pptx.js';
-import { parsePdf, renderPdfPage } from './parse-pdf.js';
+import { parsePdf, renderPdfPage, closePdfDocument } from './parse-pdf.js';
 import { parseText } from './parse-text.js';
 import { analyzeDeck, lookupTerm } from './extract.js';
-import { createSession, start, respond, classify } from './tutor.js';
+import { highlightCode } from './code.js';
+import { LIMITS } from './limits.js';
+import { createSession, start, respond, classify, questionsFor } from './tutor.js';
 import { renderMarkdown, stripMarkdown } from './markdown.js';
 import { SAMPLE_LESSON } from './sample.js';
 import {
   saveLesson, listLessons, getLesson, deleteLesson, clearAll,
   serializeDeck, reviveDeck, saveTranscript, getTranscript, loadSettings, saveSettings,
+  disableStorage,
 } from './store.js';
 import { truncate, pct } from './nlp.js';
 
@@ -19,6 +22,7 @@ const el = {
   messages: $('#messages'), chat: $('#chat'), emptyState: $('#emptyState'),
   lessonList: $('#lessonList'), libraryEmpty: $('#libraryEmpty'),
   lessonTitle: $('#lessonTitle'), slideIndicator: $('#slideIndicator'), progressText: $('#progressText'),
+  slideNav: $('#slideNav'), panelEmpty: $('#panelEmpty'), panelBody: $('#panelBody'),
   progressFill: $('#progressFill'), chips: $('#chips'), input: $('#input'), composer: $('#composer'),
   slideCardTitle: $('#slideCardTitle'), slideCardNum: $('#slideCardNum'),
   slideCanvasWrap: $('#slideCanvasWrap'), slideText: $('#slideText'),
@@ -40,6 +44,7 @@ const state = {
   settings: loadSettings(),
   lessons: [],
   lesson: null,     // { id, name, deck, session, blob, previewCache: Map, messages: [] }
+  deleted: new Set(), // ids the user removed, so a queued save cannot bring them back
   busy: false,
   typing: false,
 };
@@ -48,8 +53,9 @@ const state = {
 
 function applyTheme(theme) {
   document.documentElement.setAttribute('data-theme', theme);
+  // The rail button names the mode you would switch TO.
   const btn = document.querySelector('[data-role="theme"]');
-  if (btn) btn.textContent = theme === 'dark' ? 'Light mode' : 'Dark mode';
+  if (btn) btn.textContent = theme === 'dark' ? 'Light' : 'Dark';
 }
 
 function toggleTheme() {
@@ -66,6 +72,149 @@ function notice(text, kind = '') {
   el.messages.prepend(div);
   el.chat.scrollTop = 0;
   setTimeout(() => div.remove(), kind === 'bad' ? 14000 : 8000);
+}
+
+/* --------------------------------------------------------- slide cards --- */
+
+/** The visual for one slide, used both in the chat and in the side panel.
+ *  PDFs render the real page; PowerPoint/Word/text decks are rebuilt from the
+ *  extracted lines (with real code blocks) since there is no .pptx renderer offline. */
+function buildSlideCard(lesson, slide, { compact = false } = {}) {
+  const wrap = document.createElement('div');
+  wrap.className = 'slide-card-chat';
+  const head = document.createElement('header');
+  const strong = document.createElement('strong');
+  strong.textContent = slide.title;
+  const marker = document.createElement('span');
+  marker.className = 'marker';
+  marker.textContent = `Slide ${slide.index} of ${lesson.deck.slides.length}${slide.role && slide.role !== 'content' ? ` · ${slide.role}` : ''}`;
+  head.append(strong, marker);
+  wrap.appendChild(head);
+
+  const frame = document.createElement('div');
+  frame.className = 'frame';
+  frame.hidden = true;
+  wrap.appendChild(frame);
+
+  const body = document.createElement('div');
+  body.className = 'slide-body';
+
+  const codeLines = new Set((slide.code?.blocks || []).flatMap(b => b.lines));
+  for (const block of (slide.code?.blocks || []).slice(0, compact ? 1 : 2)) {
+    body.appendChild(codeBlockElement(block.code, block.lang, block.langLabel));
+  }
+  const rows = (slide.lines || []).filter(l => l.text && !codeLines.has(l.text)).slice(0, compact ? 6 : 16);
+  for (const line of rows) {
+    const p = document.createElement('p');
+    p.className = `line lvl${Math.min(2, line.level || 0)}${line.heading ? ' head' : ''}`;
+    if (line.bullet) {
+      const b = document.createElement('span');
+      b.className = 'bullet';
+      b.textContent = '•';
+      p.appendChild(b);
+    }
+    const span = document.createElement('span');
+    span.textContent = line.text;
+    p.appendChild(span);
+    body.appendChild(p);
+  }
+  if (!rows.length && !(slide.code?.blocks || []).length) {
+    const p = document.createElement('p');
+    p.className = 'line';
+    p.textContent = slide.source === 'pdf'
+      ? 'This page is mostly images — see the rendered page above.'
+      : 'This slide carries no extractable text (it is a picture or diagram).';
+    body.appendChild(p);
+  }
+  wrap.appendChild(body);
+
+  if (slide.notes) {
+    const note = document.createElement('div');
+    note.className = 'note-line';
+    note.textContent = `Speaker notes: ${truncate(slide.notes, 240)}`;
+    wrap.appendChild(note);
+  }
+  return wrap;
+}
+
+function codeBlockElement(code, lang, langLabel) {
+  const block = document.createElement('div');
+  block.className = 'code-block';
+  block.dataset.lang = lang || 'unknown';
+  const head = document.createElement('div');
+  head.className = 'code-head';
+  const label = document.createElement('span');
+  label.className = 'code-lang';
+  label.textContent = langLabel || 'Code';
+  const copy = document.createElement('button');
+  copy.type = 'button';
+  copy.className = 'code-copy';
+  copy.textContent = 'Copy';
+  head.append(label, copy);
+  const pre = document.createElement('pre');
+  pre.className = 'code';
+  const codeEl = document.createElement('code');
+  codeEl.innerHTML = highlightCode(code, lang || 'unknown');   // highlightCode escapes everything
+  pre.appendChild(codeEl);
+  block.append(head, pre);
+  return block;
+}
+
+/** Copy buttons on every code block inside a subtree. */
+function wireCodeCopy(root) {
+  root.querySelectorAll('.code-block').forEach(block => {
+    const btn = block.querySelector('.code-copy');
+    if (!btn || btn.dataset.wired) return;
+    btn.dataset.wired = '1';
+    btn.addEventListener('click', () => {
+      const code = block.querySelector('pre.code')?.innerText || '';
+      navigator.clipboard?.writeText(code).then(
+        () => { btn.textContent = 'Copied'; setTimeout(() => { btn.textContent = 'Copy'; }, 1200); },
+        () => notice('Your browser blocked the clipboard.', 'bad'),
+      );
+    });
+  });
+}
+
+/** Fill in the rendered page image for a PDF slide, when we still hold the original bytes. */
+function hydrateSlideImage(card, lesson, slide) {
+  if (!lesson.blob || lesson.deck.kind !== 'pdf') return;
+  const frame = card.querySelector('.frame');
+  if (!frame) return;
+  slideImage(lesson, slide.index)
+    .then(url => showFrame(frame, url))
+    .catch(() => { frame.hidden = true; });
+}
+
+/** Rendered page image, cached once per page and shared by every surface that shows it. */
+function slideImage(lesson, pageNumber) {
+  const cached = lesson.previewCache.get(pageNumber);
+  if (cached) return Promise.resolve(cached);
+  if (!lesson.pendingImages) lesson.pendingImages = new Map();
+  if (lesson.pendingImages.has(pageNumber)) return lesson.pendingImages.get(pageNumber);
+  const job = renderPdfPage(lesson.buffer, pageNumber, { key: lesson.id, maxWidth: 1100, scale: 1.3 })
+    .then(url => { cachePreview(lesson, pageNumber, url); lesson.pendingImages.delete(pageNumber); return url; })
+    .catch(err => { lesson.pendingImages.delete(pageNumber); throw err; });
+  lesson.pendingImages.set(pageNumber, job);
+  return job;
+}
+
+function showFrame(frame, url) {
+  frame.hidden = false;
+  frame.innerHTML = '';
+  const img = document.createElement('img');
+  img.src = url;
+  img.alt = 'Rendered slide';
+  frame.appendChild(img);
+}
+
+function cachePreview(lesson, pageNumber, url) {
+  lesson.previewCache.set(pageNumber, url);
+  while (lesson.previewCache.size > LIMITS.maxPdfRenderCache) {
+    const oldest = lesson.previewCache.keys().next().value;
+    if (oldest === pageNumber) break;
+    lesson.previewCache.delete(oldest);
+  }
 }
 
 /* --------------------------------------------------------- chat render --- */
@@ -132,6 +281,16 @@ async function streamInto(li, message) {
   body.appendChild(messageFooter(message));
   if (message.choices && message.choices.length) body.appendChild(choicesList(message));
   if (message.sources && message.sources.length) body.appendChild(sourcesRow(message));
+  if (message.card && message.slide) {
+    const lesson = state.lesson;
+    const slide = lesson?.deck.slides.find(s => s.index === message.slide);
+    if (slide) {
+      const card = buildSlideCard(lesson, slide);
+      body.appendChild(card);
+      hydrateSlideImage(card, lesson, slide);
+    }
+  }
+  wireCodeCopy(body);
   scrollChat();
 }
 
@@ -261,6 +420,7 @@ async function refreshLibrary() {
   el.libraryEmpty.hidden = state.lessons.length > 0;
   for (const lesson of state.lessons) {
     const li = document.createElement('li');
+    li.className = 'lesson-row';
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'lesson-item';
@@ -268,30 +428,39 @@ async function refreshLibrary() {
     const name = document.createElement('span');
     name.className = 'li-name';
     name.textContent = lesson.name;
-    const ring = document.createElement('span');
-    ring.className = 'li-ring';
-    const done = lesson.progress?.visited || 0;
-    ring.textContent = lesson.progress?.slides ? `${done}/${lesson.progress.slides}` : '';
     const meta = document.createElement('span');
     meta.className = 'li-meta';
     meta.textContent = [lesson.progress?.label, lesson.stats?.slides ? `${lesson.stats.slides} slides` : '', lesson.fileName || '']
       .filter(Boolean).join(' · ');
+    btn.append(name, meta);
+    btn.addEventListener('click', () => openLesson(lesson.id));
+
+    // Delete sits beside the open button, never inside it (nested buttons break click handling).
     const del = document.createElement('button');
     del.type = 'button';
-    del.className = 'chip';
+    del.className = 'li-del';
     del.textContent = '×';
-    del.title = 'Delete this lesson';
-    del.style.gridColumn = '2';
+    del.title = `Delete “${lesson.name}”`;
+    del.setAttribute('aria-label', `Delete ${lesson.name}`);
     del.addEventListener('click', async (ev) => {
       ev.stopPropagation();
       if (!window.confirm(`Delete “${lesson.name}” and its transcript?`)) return;
+      state.deleted.add(lesson.id);            // stop any queued save from resurrecting it
       await deleteLesson(lesson.id);
-      if (state.lesson?.id === lesson.id) { state.lesson = null; el.messages.innerHTML = ''; showEmptyState(true); }
+      closePdfDocument(lesson.id);
+      if (state.lesson?.id === lesson.id) {
+        state.lesson = null;
+        clearTimeout(persistTimer);
+        savePending = false;
+        el.messages.innerHTML = '';
+        showEmptyState(true);
+        renderHeader();
+        syncChips();
+      }
       await refreshLibrary();
     });
-    btn.append(name, ring, meta, del);
-    btn.addEventListener('click', () => openLesson(lesson.id));
-    li.appendChild(btn);
+
+    li.append(btn, del);
     el.lessonList.appendChild(li);
   }
 }
@@ -300,6 +469,24 @@ function showEmptyState(show) {
   el.emptyState.hidden = !show;
   // The messages list is a flex container, so the hidden attribute alone is not enough.
   el.messages.style.display = show ? 'none' : 'flex';
+  if (show) refreshWelcome();
+}
+
+/** A time-of-day greeting, personalised once the learner adds their name. */
+function refreshWelcome() {
+  const name = (state.settings.learner || '').trim();
+  const hour = new Date().getHours();
+  const part = hour < 5 ? 'Still up' : hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
+  const greeting = `#welcomeGreeting`;
+  const node = document.getElementById('welcomeGreeting');
+  if (!node) return;
+  node.textContent = `${part}${name ? `, ${name}` : ''}.`;
+  const lede = document.getElementById('welcomeLede');
+  if (lede) {
+    lede.textContent = name
+      ? `I am Cyzie. Hand me your ${state.settings.focus || 'lecture'} slides and I will teach them to you one slide at a time — explaining each page, questioning you on it, and answering whatever you ask, straight from your file.`
+      : 'I am Cyzie. Give me your lecture slides and I will teach them to you one slide at a time — explaining each page, questioning you on it, and answering whatever you ask, straight from your file.';
+  }
 }
 
 /* -------------------------------------------------------------- header --- */
@@ -312,11 +499,13 @@ function renderHeader() {
   const lesson = state.lesson;
   if (!lesson) {
     el.lessonTitle.textContent = 'No lesson loaded';
-    el.slideIndicator.textContent = 'Upload a file to begin';
+    el.slideIndicator.textContent = '';
     el.progressText.textContent = '';
     el.progressFill.style.width = '0%';
+    if (el.slideNav) el.slideNav.hidden = true;
     return;
   }
+  if (el.slideNav) el.slideNav.hidden = false;
   const session = lesson.session;
   const slide = lesson.deck.slides.find(s => s.index === session.slide);
   el.lessonTitle.textContent = lesson.name;
@@ -363,7 +552,10 @@ function syncChips() {
 
 function renderContext() {
   const lesson = state.lesson;
-  if (!lesson) return;
+  const hasLesson = !!(lesson && lesson.deck?.slides?.length);
+  if (el.panelEmpty) el.panelEmpty.hidden = hasLesson;
+  if (el.panelBody) el.panelBody.hidden = !hasLesson;
+  if (!hasLesson) return;
   const session = lesson.session;
   const slide = lesson.deck.slides.find(s => s.index === session.slide);
   if (!slide) return;
@@ -390,18 +582,14 @@ function renderContext() {
     el.slideText.appendChild(p);
   }
 
-  // Rendered page image for PDFs (the original bytes are kept locally for this).
-  const cacheKey = slide.index;
-  const cached = lesson.previewCache?.get(cacheKey);
   if (lesson.blob && lesson.deck.kind === 'pdf') {
-    if (cached) {
-      showPreview(cached);
-    } else {
+    const cached = lesson.previewCache.get(slide.index);
+    if (cached) showPreview(cached);
+    else {
       el.slideCanvasWrap.hidden = true;
-      renderPdfPage(lesson.buffer, slide.index, { scale: 1.25 }).then(url => {
-        lesson.previewCache.set(cacheKey, url);
-        if (state.lesson?.session?.slide === slide.index) showPreview(url);
-      }).catch(() => { el.slideCanvasWrap.hidden = true; });
+      slideImage(lesson, slide.index)
+        .then(url => { if (state.lesson?.session?.slide === slide.index) showPreview(url); })
+        .catch(() => { el.slideCanvasWrap.hidden = true; });
     }
   } else {
     el.slideCanvasWrap.hidden = true;
@@ -409,9 +597,9 @@ function renderContext() {
 
   // Question progress for this slide.
   el.qdots.innerHTML = '';
-  const plan = session.plan.find(p => p.slide === slide.index);
   const stats = session.perSlide[slide.index] || { asked: 0, correct: 0, partial: 0, incorrect: 0 };
-  const questions = plan?.questions || [];
+  // Questions are built on arrival, so ask the tutor for this slide's set rather than reading the plan.
+  const questions = slide.skipQuestions ? [] : questionsFor(session, slide);
   if (!questions.length) {
     const span = document.createElement('span');
     span.style.color = 'var(--muted)';
@@ -532,7 +720,7 @@ async function send(text) {
     }
   }
   state.busy = false;
-  el.sendBtn.disabled = false;
+  autoGrow();          // the send button tracks whether there is anything to send
   el.input.focus();
 }
 
@@ -583,7 +771,13 @@ function buildStudySheet(lesson) {
   }
 
   const missed = session.missed || [];
-  const plan = (session.plan || []).flatMap(p => p.questions);
+  // Every question the session has built (a restored session rebuilds only some of them),
+  // plus anything still sitting in the plan, de-duplicated by id.
+  const seen = new Set();
+  const plan = [];
+  for (const q of [...(session.builtQuestions?.values() || []), ...(session.plan || []).flatMap(p => p.questions || [])]) {
+    if (q && !seen.has(q.id)) { seen.add(q.id); plan.push(q); }
+  }
   if (missed.length) {
     lines.push('## Questions to review');
     lines.push('');
@@ -627,18 +821,25 @@ async function pickFile() {
 }
 
 async function ingestFile(file) {
-  if (!file) return;
+  if (!file) return false;
+  if (state.busy) { notice('Still reading the last file — one moment.'); return false; }
   if (file.size > MAX_FILE) {
     notice(`That file is ${(file.size / 1048576).toFixed(1)} MB. Cyzie works with files up to ${MAX_FILE / 1048576} MB.`, 'bad');
-    return;
+    return false;
   }
   const name = file.name || 'lesson';
   const ext = (name.split('.').pop() || '').toLowerCase();
   if (!['pdf', 'pptx', 'docx', 'txt', 'md', 'markdown'].includes(ext)) {
     notice(`${name}: Cyzie reads .pptx, .pdf, .docx, .txt and .md files. (Old .ppt and .doc formats need to be saved again in the newer format.)`, 'bad');
-    return;
+    return false;
+  }
+  if (!(await looksLikeItsType(file, ext))) {
+    notice(`${name}: this does not look like a real .${ext} file — it may be renamed, truncated, or a different format. Export it again from PowerPoint / Word / your PDF reader and retry.`, 'bad');
+    return false;
   }
 
+  state.busy = true;                 // one upload at a time: no half-built lessons
+  el.sendBtn.disabled = true;
   showEmptyState(false);
   el.messages.innerHTML = '';
   const progressLine = addAssistantShell('note');
@@ -669,11 +870,31 @@ async function ingestFile(file) {
       blob: ext === 'pdf' && buffer.byteLength <= PREVIEW_BLOB_LIMIT ? new Blob([buffer], { type: 'application/pdf' }) : null,
       buffer: ext === 'pdf' ? buffer : null,
     });
+    return true;
   } catch (err) {
-    console.error(err);
+    // A file we cannot read is an expected outcome, not a crash — log it quietly.
+    console.warn(`Cyzie could not read ${name}:`, err?.message || err);
     progressLine.remove();
     notice(`${name}: ${err.message}. If the file came from Google Slides, export it as .pptx or PDF first.`, 'bad');
+    return false;
+  } finally {
+    state.busy = false;
+    autoGrow();
   }
+}
+
+/** Cheap signature check: a .pdf must start with %PDF, a .pptx/.docx must be a zip. */
+async function looksLikeItsType(file, ext) {
+  const wantsZip = ext === 'pptx' || ext === 'docx';
+  if (ext === 'md' || ext === 'markdown' || ext === 'txt') return true;
+  try {
+    const head = new Uint8Array(await file.slice(0, 8).arrayBuffer());
+    if (wantsZip) return head[0] === 0x50 && head[1] === 0x4b;
+    if (ext === 'pdf') return head[0] === 0x25 && head[1] === 0x50 && head[2] === 0x44 && head[3] === 0x46;
+  } catch {
+    return true;   // if the bytes cannot be peeked at, let the parser give the real answer
+  }
+  return true;
 }
 
 async function createLessonFromDeck(deck, { name, fileName = '', blob = null, buffer = null } = {}) {
@@ -686,6 +907,7 @@ async function createLessonFromDeck(deck, { name, fileName = '', blob = null, bu
     blob,
     buffer,
     previewCache: new Map(),
+    pendingImages: new Map(),
     messages: [],
     session: null,
   };
@@ -713,6 +935,7 @@ async function openLesson(id) {
       blob: record.blob || null,
       buffer: null,
       previewCache: new Map(),
+      pendingImages: new Map(),
       messages: [],
       session: null,
     };
@@ -745,7 +968,7 @@ function renderTranscript(messages) {
   const liveQuestionId = session.current?.id;
   for (const m of messages) {
     if (m.role === 'user') { addUserMessage(m.text); continue; }
-    const li = addAssistantShell(m.kind);
+    const li = addAssistantShell(m.kind, m.tone);
     const body = li.querySelector('.body');
     body.innerHTML = renderMarkdown(m.text || '');
     body.appendChild(messageFooter(m));
@@ -758,6 +981,15 @@ function renderTranscript(messages) {
       body.appendChild(list);
     }
     if (m.sources?.length) body.appendChild(sourcesRow(m));
+    if (m.card && m.slide) {
+      const slide = state.lesson.deck.slides.find(s => s.index === m.slide);
+      if (slide) {
+        const card = buildSlideCard(state.lesson, slide, { compact: true });
+        body.appendChild(card);
+        hydrateSlideImage(card, state.lesson, slide);
+      }
+    }
+    wireCodeCopy(body);
     state.lesson.messages.push(m);
   }
   scrollChat();
@@ -790,8 +1022,8 @@ function restoreSession(session, snap) {
   session.stats = snap.stats || session.stats;
   if (snap.perSlide) session.perSlide = { ...session.perSlide, ...snap.perSlide };
 
-  const plan = session.plan.find(p => p.slide === session.slide);
-  const pool = plan?.questions?.length ? plan.questions : [];
+  // Rebuilding is deterministic (same seed + slide), so the restored ids line up exactly.
+  const pool = questionsFor(session, session.slide);
   const byId = new Map(pool.map(q => [q.id, q]));
   const restoredQueue = (snap.queueIds || []).map(qid => byId.get(qid)).filter(Boolean);
   session.queue = restoredQueue.length ? restoredQueue : pool;
@@ -818,7 +1050,7 @@ function persistSoon() {
 
 async function persistLesson() {
   const lesson = state.lesson;
-  if (!lesson) return;
+  if (!lesson || state.deleted.has(lesson.id)) return;
   try {
     const teachable = teachableSlides().map(s => s.index);
     const visited = new Set(lesson.session.seenSlides).size;
@@ -876,6 +1108,26 @@ function wire() {
   $('#sampleBtn').addEventListener('click', loadSample);
   el.fileInput.addEventListener('change', () => ingestFile(el.fileInput.files?.[0]));
 
+  // Welcome-screen suggestion chips: with a lesson loaded they go to Cyzie, without one
+  // they explain what to do first.
+  document.querySelectorAll('#suggestions button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const line = btn.dataset.say || '';
+      if (state.lesson) send(line);
+      else {
+        const focus = /python/i.test(line) ? 'python' : /java/i.test(line) ? 'java' : '';
+        if (focus) state.settings = saveSettings({ focus });
+        showEmptyState(true);
+        refreshWelcome();
+        notice(`Drop your ${focus || 'lecture'} slides above (or click Choose a file) and I will build the lesson from them. Ask me anything once we start.`);
+      }
+    });
+  });
+  $('#helpBtn')?.addEventListener('click', () => {
+    if (state.lesson) send('help');
+    else notice('Upload a file first — I read it in your browser, then walk you through it slide by slide. Everything you can say to me is listed with the help command once a lesson is open.');
+  });
+
   el.menuBtn.addEventListener('click', () => {
     if (window.innerWidth <= 860) {
       document.body.classList.toggle('sidebar-open');
@@ -894,7 +1146,7 @@ function wire() {
     renderContext();
   });
   el.scrim.addEventListener('click', closeDrawers);
-  el.themeBtn.addEventListener('click', toggleTheme);
+  el.themeBtn?.addEventListener('click', toggleTheme);
   document.querySelector('[data-role="theme"]').addEventListener('click', toggleTheme);
   el.prevSlideBtn.addEventListener('click', () => {
     const s = state.lesson?.session;
@@ -970,13 +1222,24 @@ async function loadSample() {
 /* ---------------------------------------------------------------- boot --- */
 
 async function boot() {
+  if (params.has('nostore')) disableStorage('storage disabled for this run');
   applyTheme(state.settings.theme);
+  refreshWelcome();
   wire();
   autoGrow();
+  // The brand mark returns to the home screen (and offers the file picker there).
+  document.querySelector('.brand')?.addEventListener('click', () => {
+    showEmptyState(true);
+    closeDrawers();
+  });
+  document.querySelector('.brand')?.setAttribute('role', 'button');
+  document.querySelector('.brand')?.setAttribute('title', 'Home');
   await refreshLibrary();
-  const recent = state.lessons[0];
-  if (recent) {
-    await openLesson(recent.id);
+  if (params.has('demo')) {
+    // ?demo=1 opens the built-in sample lesson — handy for screenshots and first looks.
+    await loadSample();
+  } else if (state.lessons[0] && !params.has('fresh')) {
+    await openLesson(state.lessons[0].id);
   } else {
     showEmptyState(true);
     renderHeader();

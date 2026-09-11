@@ -2,9 +2,10 @@
    Pure state machine: no DOM, no network, everything read from the uploaded deck. */
 
 import { buildIndex, search, answerQuestion, rankSlides } from './retrieve.js';
-import { buildQuestions, buildLessonPlan } from './questions.js';
+import { buildQuestions } from './questions.js';
 import { gradeAnswer, scoreBand } from './grade.js';
 import { lookupTerm, estimateQuestions, looksLikeCode } from './extract.js';
+import { evaluateObjectives, ROLE } from './deck-intel.js';
 import { keyStems, contentWords, words, normalize, truncate, pct, pick, clamp } from './nlp.js';
 
 /* ------------------------------------------------------------ helpers ---- */
@@ -42,13 +43,17 @@ export function createSession(deck, opts = {}) {
   const density = opts.density || 'standard';
   const seed = opts.seed || `cyzie-${deck.deckTitle}`;
   const index = buildIndex(deck);
-  const plan = opts.plan || buildLessonPlan(deck, { density, seed });
+  // Questions are built per slide on arrival (see questionsFor) — pre-building every
+  // question for a 200-page deck wastes seconds and a lot of memory.
+  const plan = opts.plan || deck.slides.map(s => ({ slide: s.index, skip: s.skipQuestions, questions: null }));
+  const perSlide = density === 'quick' ? 3 : density === 'deep' ? 7 : 5;
   const first = deck.slides.find(s => !s.skipQuestions) || deck.slides[0];
   const state = {
     version: 1,
     deckTitle: deck.deckTitle,
     density,
     seed,
+    builtQuestions: new Map(),   // every question this session has produced, by id
     learner: (opts.learner || '').trim(),
     index,
     plan,
@@ -76,6 +81,27 @@ export function createSession(deck, opts = {}) {
 
 function slideOf(state, n) {
   return state.index.deck.slides.find(s => s.index === n);
+}
+
+/** The question set for one slide, built the first time the lesson reaches it. */
+export function questionsFor(state, slideOrIndex, { count = null, force = false, tag = '' } = {}) {
+  const index = typeof slideOrIndex === 'number' ? slideOrIndex : slideOrIndex.index;
+  const slide = typeof slideOrIndex === 'object' ? slideOrIndex : slideOf(state, index);
+  if (!slide || slide.skipQuestions) return [];
+  const entry = state.plan.find(p => p.slide === index);
+  const perSlide = state.density === 'quick' ? 3 : state.density === 'deep' ? 7 : 5;
+  const n = count || perSlide;
+  if (entry && entry.questions && !force && !tag && entry.builtWith === n) return entry.questions;
+  const questions = buildQuestions(state.index.deck, slide, { count: n, seed: tag ? `${state.seed}|${tag}` : state.seed });
+  for (const q of questions) {
+    state.builtQuestions.set(q.id, q);
+    // Keep the memory footprint bounded on very long decks.
+    if (state.builtQuestions.size > 600) {
+      state.builtQuestions.delete(state.builtQuestions.keys().next().value);
+    }
+  }
+  if (entry && !tag) { entry.questions = questions; entry.builtWith = n; return questions; }
+  return questions;
 }
 
 function slideStats(state, n) {
@@ -116,6 +142,9 @@ function overviewMessage(state) {
 }
 
 function slideIntro(state, slide) {
+  // Code slides are taught by walking the code, not by listing bullets about it.
+  if (slide.role === 'code' || slide.code?.blocks?.length) return codeIntro(state, slide);
+
   const lines = [`### Slide ${slide.index} — ${slide.title}`];
   const points = [];
   for (const line of slide.lines) {
@@ -123,18 +152,141 @@ function slideIntro(state, slide) {
     if (line.text.toLowerCase() === slide.title.toLowerCase()) continue;
     if (words(line.text).length < 3) continue;
     points.push(line);
-    if (points.length >= 5) break;
+    // The slide card below the message already shows the page text, so keep the spoken
+    // version short instead of repeating every line twice.
+    if (points.length >= 3) break;
   }
   if (points.length) {
     lines.push(points.map(p => `- ${truncate(stripMd(lineClean(p)), 165)}`).join('\n'));
   } else if (slide.terms.length) {
     lines.push(slide.terms.slice(0, 4).map(t => `- **${t.term}**${t.definition ? ` — ${truncate(stripMd(t.definition), 120)}` : ''}`).join('\n'));
-  } else if (slide.codeHeavy) {
-    lines.push('_This slide is mostly code._');
   } else {
     lines.push('_There is little extractable text on this slide — it looks like a picture or diagram._');
   }
+  // Definitions only earn their place when they add something the bullets did not already say.
+  const spoken = points.map(p => normalize(stripMd(lineClean(p))).toLowerCase());
+  const defined = slide.terms
+    .filter(t => t.definition && !spoken.some(s => s.includes(normalize(stripMd(t.definition)).toLowerCase().slice(0, 40))))
+    .slice(0, 2);
+  if (defined.length) {
+    lines.push('');
+    lines.push(defined.map(t => `**${t.term}** — ${truncate(stripMd(t.definition), 150)}`).join('\n\n'));
+  }
   if (slide.notes) lines.push(`\n> **Speaker notes:** ${truncate(stripMd(slide.notes), 220)}`);
+  return lines.join('\n');
+}
+
+/** Explain a code slide: what the code is, then a line-by-line reading of the key lines. */
+function codeIntro(state, slide) {
+  const code = slide.code;
+  const block = code?.blocks?.[0];
+  const lines = [`### Slide ${slide.index} — ${slide.title}`];
+  if (!block) return lines.join('\n');
+
+  const constructs = code.constructs.slice(0, 4).map(c => c.label).join(', ');
+  lines.push(`${block.langLabel}${block.size > 1 ? ` · ${block.size} lines` : ''}${constructs ? ` · shows ${constructs}` : ''}`);
+  lines.push('');
+  lines.push('```' + block.lang + '\n' + block.code + '\n```');
+
+  const walk = (code.walk || []).filter(w => w.meaning && !/^a comment/i.test(w.meaning)).slice(0, 4);
+  if (walk.length) {
+    lines.push('**Line by line:**');
+    lines.push(walk.map(w => `- \`${truncate(w.line, 70)}\` — ${w.meaning}`).join('\n'));
+  }
+  const prose = slide.facts.slice(0, 2).map(f => `- ${truncate(stripMd(f.text), 170)}`);
+  if (prose.length) lines.push(`\n**What the slide says about it:**\n${prose.join('\n')}`);
+  if (code.output) {
+    lines.push(`\n**It prints:** ${truncate(code.output.summary, 120)}`);
+  } else if (code.stated.length) {
+    lines.push(`\n**The slide gives the output as:** ${truncate(code.stated[0].text, 120)}`);
+  }
+  if (slide.notes) lines.push(`\n> **Speaker notes:** ${truncate(stripMd(slide.notes), 200)}`);
+  return lines.join('\n');
+}
+
+/* ------------------------------------------------------ deck structure --- */
+
+function coverMessage(slide) {
+  const lines = [`### ${slide.title}`];
+  const sub = slide.lines.map(l => stripMd(l.text)).filter(t => t && t.toLowerCase() !== slide.title.toLowerCase()).slice(0, 3);
+  if (sub.length) lines.push(sub.join('  ·  '));
+  lines.push('');
+  lines.push('This is the title slide — nothing to answer here. Let me show you what the deck covers.');
+  return lines.join('\n');
+}
+
+function agendaMessage(state, slide) {
+  const roadmap = state.index.deck.roadmap || [];
+  const lines = [`### Slide ${slide.index} — ${slide.title}`];
+  if (roadmap.length) {
+    lines.push(`The deck lays out ${roadmap.length} topic${roadmap.length === 1 ? '' : 's'} for this session:`);
+    lines.push('');
+    lines.push(roadmap.map((t, i) => `${i + 1}. **${t.label}**${t.slides.length ? `  _(${t.slides.length} slide${t.slides.length === 1 ? '' : 's'})_` : ''}`).join('\n'));
+    lines.push('');
+    lines.push('We will take them in that order, and I will question you as we go.');
+  } else {
+    lines.push(slide.facts.slice(0, 6).map(f => `- ${truncate(stripMd(f.text), 160)}`).join('\n'));
+    lines.push('');
+    lines.push('That is the shape of the session.');
+  }
+  return lines.join('\n');
+}
+
+function objectivesMessage(state, slide) {
+  const objectives = state.index.deck.objectives || [];
+  const lines = [`### Slide ${slide.index} — ${slide.title}`];
+  if (objectives.length) {
+    lines.push('By the end of this session you should be able to:');
+    lines.push('');
+    lines.push(objectives.map((o, i) => `${i + 1}. ${o.text}`).join('\n'));
+    lines.push('');
+    lines.push('I will check these with you at the end — if one of them is still shaky, I will say so and we can go back.');
+  } else {
+    lines.push(slide.facts.slice(0, 6).map(f => `- ${truncate(stripMd(f.text), 160)}`).join('\n'));
+  }
+  return lines.join('\n');
+}
+
+function sectionMessage(state, slide) {
+  const roadmap = state.index.deck.roadmap || [];
+  const topic = roadmap.find(t => t.slides?.includes(slide.index) || t.best === slide.index);
+  const position = topic ? ` — topic ${roadmap.indexOf(topic) + 1} of ${roadmap.length}` : '';
+  const lines = [`### ${slide.title}`, ''];
+  lines.push(`New section${position}.`);
+  const items = slide.lines.filter(l => words(l.text) >= 2 && l.text.toLowerCase() !== slide.title.toLowerCase()).slice(0, 5);
+  if (items.length) lines.push('', items.map(l => `- ${truncate(stripMd(l.text), 150)}`).join('\n'));
+  return lines.join('\n');
+}
+
+function activityMessage(state, slide) {
+  const lines = [`### Slide ${slide.index} — ${slide.title}`, ''];
+  lines.push('This slide is an exercise, so there is nothing for me to quiz you on yet — it is your turn.');
+  const items = slide.lines.filter(l => words(l.text) >= 2).slice(0, 5);
+  if (items.length) lines.push('', items.map(l => `- ${truncate(stripMd(l.text), 150)}`).join('\n'));
+  lines.push('', 'Do it now, then tell me **next** and I will quiz you on what it was practising.');
+  return lines.join('\n');
+}
+
+function recapMessage(state, slide) {
+  const lines = [`### Slide ${slide.index} — ${slide.title}`, ''];
+  lines.push('The deck\'s own recap:');
+  const items = slide.lines.filter(l => words(l.text) >= 2).slice(0, 7);
+  if (items.length) lines.push('', items.map(l => `- ${truncate(stripMd(l.text), 160)}`).join('\n'));
+  return lines.join('\n');
+}
+
+function closingMessage(state, slide, message) {
+  if (slide.role === 'thanks') {
+    return `### ${slide.title}\n\nThat is the end of the deck. ${message}`;
+  }
+  return `### Slide ${slide.index} — ${slide.title}\n\nThese are the sources and further reading the deck lists.\n\n${slide.facts.slice(0, 5).map(f => `- ${truncate(stripMd(f.text), 150)}`).join('\n')}`;
+}
+
+function visualMessage(state, slide) {
+  const lines = [`### Slide ${slide.index} — ${slide.title}`, ''];
+  lines.push('This slide is a picture or diagram with no extractable text, so there is nothing for me to question you on.');
+  if (slide.notes) lines.push('', `> **Speaker notes:** ${truncate(stripMd(slide.notes), 240)}`);
+  lines.push('', 'Look at the diagram in your file, then say **next**.');
   return lines.join('\n');
 }
 
@@ -256,6 +408,7 @@ function slideSummaryMessage(state, slide) {
 function lessonSummaryMessage(state) {
   const deck = state.index.deck;
   const s = state.stats;
+  const session = state;
   const total = s.answered || 1;
   const accuracy = s.correct / total;
   const rows = [];
@@ -273,13 +426,26 @@ function lessonSummaryMessage(state) {
     lines.push('\nSlides to revisit:');
     lines.push(weak.map(w => `- **Slide ${w.slide}** — ${truncate(w.title, 60)} (${w.pct}%)`).join('\n'));
   } else if (rows.length) lines.push('\nNothing scored below 65% — this is solid coverage.');
+
+  // The deck's own learning objectives, scored against what was actually answered.
+  const objectives = evaluateObjectives(deck.objectives || [], session);
+  if (objectives.length) {
+    lines.push('\n### Against the stated objectives');
+    for (const o of objectives) {
+      const mark = o.status === 'demonstrated' ? '✅' : o.status === 'partial' ? '◐' : o.status === 'shaky' ? '⚠️' : '·';
+      lines.push(`- ${mark} ${truncate(o.text, 90)}${o.pct != null ? ` — ${o.pct}%` : ' — not tested'}`);
+    }
+    const shaky = objectives.filter(o => o.status === 'shaky');
+    if (shaky.length) lines.push(`\nI would revisit: ${shaky.map(o => `**${truncate(o.text, 50)}**`).join(', ')}.`);
+  }
+
   const glossaryCount = [...deck.glossary.values()].filter(t => t.definition).length;
   if (glossaryCount) lines.push(`\nI built ${glossaryCount} definition${glossaryCount === 1 ? '' : 's'} from this deck — ask for the “glossary” any time.`);
   return msg(lines.join('\n'), {
     kind: 'summary',
     chips: weak.length
-      ? [{ label: `Review slide ${weak[0].slide}`, send: `go to slide ${weak[0].slide}` }, { label: 'Quiz me on my misses', send: 'quiz me on my misses' }]
-      : [{ label: 'Quiz me again', send: 'quiz me' }, { label: 'Glossary', send: 'glossary' }],
+      ? [{ label: `Review slide ${weak[0].slide}`, send: `go to slide ${weak[0].slide}` }, { label: 'Quiz me on my misses', send: 'quiz me on my misses' }, { label: 'Study sheet', send: 'study sheet' }]
+      : [{ label: 'Quiz me again', send: 'quiz me' }, { label: 'Glossary', send: 'glossary' }, { label: 'Study sheet', send: 'study sheet' }],
   });
 }
 
@@ -344,6 +510,9 @@ const INTENT_PATTERNS = [
   ['thanks', /^(?:thanks|thank you|thx|ty|appreciate it)\b/i],
   ['greeting', /^(?:hi|hello|hey|yo|good (?:morning|afternoon|evening))\b/i],
   ['simpler', /(?:in simple(?:r)? terms|simpl(?:er|ify|ified)|explain (?:it )?(?:more )?simpl|i (?:don'?t|dont|do not) (?:understand|get it|get)|confus|too (?:hard|complex|fast)|break (?:it|this) down|baby ?steps)/i],
+  ['explain_code', /(?:explain|walk (?:me )?through|talk me through|what does)\s+(?:this|the|that|my)?\s*code|(?:what|how) does (?:this|that) code (?:do|work)|read (?:me )?(?:this|the) code/i],
+  ['code_task', /(?:code (?:task|challenge|drill|question|exercise)|(?:give|gimme) me (?:another |a )?(?:code|coding|programming)?\s*(?:task|challenge|drill|question|exercise)|more code questions?|let me (?:write|type) some code|practice (?:some )?code)/i],
+  ['roadmap', /^(?:objectives?|learning outcomes?|roadmap|agenda|contents|outline|what will (?:i|we) learn|what.?s (?:covered|on the agenda)|what (?:are )?the (?:topics|goals?))\??$/i],
   ['example', /(?:^|\b)(?:give me an example|for example|an example|illustrate|show me an example|example of (?:this|it))/i],
   ['detail', /(?:more detail|elaborate|tell me more|go deeper|expand on (?:that|this)|more on that)/i],
   ['harder', /(?:harder|more difficult|challenge me|tough(?:er)? questions)/i],
@@ -353,6 +522,19 @@ const INTENT_PATTERNS = [
 const JUMP_RE = /(?:\bgo to\b|\bjump to\b|\bskip to\b|\bopen\b)?\s*\b(?:slide|page|part)\s*(?:number\s*)?#?(\d{1,3})\b/i;
 const WHERE_RE = /^where\s+(?:is|are|does|do|can i find|is it)\b/i;
 const DEFINE_RE = /^(?:what(?:'s| is| are| does| do)|who(?:'s| is| are)|define|explain|describe|tell me about|meaning of|what about|why (?:is|are|does))\b/i;
+
+const QUESTION_START_RE = /^(?:how|why|what|where|when|who|which|whose|can|could|should|would|do|does|did|is|are|was|were|will|may|might)/i;
+
+/** A message that is plainly a question rather than an answer to the open question. */
+function isPlainQuestion(text) {
+  const t = String(text || '').trim();
+  if (!t) return false;
+  const endsQuestion = /\?\s*$/.test(t);
+  if (!endsQuestion && !QUESTION_START_RE.test(t)) return false;
+  // "how should i revise for my exam?" only carries two content words, so accept either a
+  // question mark or at least two real words.
+  return contentWords(t).length >= 2 || endsQuestion;
+}
 
 export function classify(state, text) {
   const t = normalize(text);
@@ -372,6 +554,11 @@ export function classify(state, text) {
   if (DEFINE_RE.test(t)) return { intent: 'define', query: t };
   if (t.length > 180) return { intent: 'answer' };
   if (/^(?:quiz me on|test me on)\s+(.+)/i.test(t)) return { intent: 'quiz_topic', query: t.replace(/^.*?\bon\s+/i, '') };
+  // While a question is open, a learner may still ask one of their own. A plainly interrogative
+  // message is answered (then the open question is restated) instead of being eaten as an attempt.
+  if (state.awaiting === 'answer' && isPlainQuestion(t)) {
+    return { intent: DEFINE_RE.test(t) ? 'define' : 'question', query: t };
+  }
   if (state.awaiting === 'answer') return { intent: 'answer' };
   if (String(text).trim().startsWith('/')) return { intent: 'unknown' };
   return { intent: 'question', query: t };
@@ -379,26 +566,59 @@ export function classify(state, text) {
 
 /* -------------------------------------------------------------- flows ---- */
 
+/** Remind the learner that a question is still open after answering a side question. */
+function nudgeOpenQuestion(state, messages) {
+  if (state.awaiting !== 'answer' || !state.current) return;
+  const slide = slideOf(state, state.current.slide);
+  messages.push(msg(`Still open: the question on slide ${state.current.slide}${slide ? ` (${truncate(slide.title, 40)})` : ''}. Answer when you are ready, say **hint** for a nudge, or **skip** to move on.`, { kind: 'note' }));
+}
+
+/** The teaching message for a slide depends on what the slide is FOR. */
+function teachingFor(state, slide) {
+  switch (slide.role) {
+    case 'cover': return { text: coverMessage(slide), kind: 'teach', card: true, chips: [{ label: 'Show me the plan', send: 'next' }] };
+    case 'agenda': return { text: agendaMessage(state, slide), kind: 'teach', card: true, chips: [{ label: 'Start topic 1', send: 'next' }] };
+    case 'objectives': return { text: objectivesMessage(state, slide), kind: 'teach', card: true, chips: [{ label: 'Start', send: 'next' }] };
+    case 'section': return { text: sectionMessage(state, slide), kind: 'teach', card: true };
+    case 'activity': return { text: activityMessage(state, slide), kind: 'teach', card: true };
+    case 'quiz': return { text: `### Slide ${slide.index} — ${slide.title}\n\nThe deck puts its own quiz here. Answer it on paper, then say **next** and I will test you on the same material.`, kind: 'teach', card: true };
+    case 'recap': return { text: recapMessage(state, slide), kind: 'teach', card: true };
+    case 'references': return { text: closingMessage(state, slide, ''), kind: 'teach', card: true };
+    case 'thanks': return { text: closingMessage(state, slide, 'We are done.'), kind: 'teach', card: true };
+    case 'visual': return { text: visualMessage(state, slide), kind: 'teach', card: true };
+    default: return { text: slideIntro(state, slide), kind: 'teach', card: true };
+  }
+}
+
 function startSlide(state, n, messages) {
   const slide = slideOf(state, n);
   if (!slide) return messages;
   state.slide = n;
   state.seenSlides.push(n);
   state.retry = null;
-  const plan = state.plan.find(p => p.slide === n);
-  state.queue = (plan && plan.questions ? plan.questions.slice() : buildQuestions(state.index.deck, slide, { count: 5, seed: state.seed }));
+  state.queue = questionsFor(state, slide).slice();
   state.qCursor = 0;
   state.current = null;
   state.awaiting = null;
-  messages.push(msg(slideIntro(state, slide), { kind: 'teach', slide: n }));
+
+  const taught = teachingFor(state, slide);
+  messages.push(msg(taught.text, { kind: taught.kind, slide: n, card: taught.card, chips: taught.chips }));
+
   if (!state.queue.length) {
-    messages.push(msg(slide.skipQuestions
-      ? 'There is nothing quizzable on this slide — I will move us on.'
-      : 'I could not build reliable questions from this slide.', { kind: 'note', slide: n }));
     state.phase = 'slideSummary';
     state.awaiting = 'continue';
-    messages.push(msg('Say **next** when you are ready for the following slide.', {
-      chips: [{ label: 'Next slide', send: 'next' }, { label: 'Ask about this slide', send: `what is on slide ${n}?` }],
+    const why = slide.role === 'cover' ? 'title slide'
+      : slide.role === 'agenda' ? 'contents slide'
+        : slide.role === 'objectives' ? 'objectives slide'
+          : slide.role === 'section' ? 'section divider'
+            : slide.role === 'activity' ? 'exercise slide'
+              : slide.role === 'visual' ? 'picture-only slide'
+                : slide.role === 'references' || slide.role === 'thanks' ? 'closing slide'
+                  : 'nothing quizzable';
+    messages.push(msg(`That is a ${why}, so no questions on it.`, {
+      kind: 'note',
+      slide: n,
+      chips: nextSlideChips(state, n),
     }));
     return messages;
   }
@@ -408,6 +628,15 @@ function startSlide(state, n, messages) {
   state.awaiting = 'answer';
   messages.push(askMessage(state));
   return messages;
+}
+
+function nextSlideChips(state, n) {
+  const next = nextSlideNumber(state, n);
+  const chips = next == null
+    ? [{ label: 'Wrap up', send: 'summary' }]
+    : [{ label: `Next: slide ${next}`, send: 'next' }];
+  chips.push({ label: 'Ask about this one', send: `what is on slide ${n}?` });
+  return chips;
 }
 
 function advanceQuestion(state, messages) {
@@ -622,7 +851,7 @@ function handleQuiz(state, messages, { topic = null } = {}) {
     if (ranked.length) {
       const n = ranked[0].slide;
       const slide = slideOf(state, n);
-      const qs = buildQuestions(deck, slide, { count: 3, seed: `${state.seed}|topic|${topic}` });
+      const qs = questionsFor(state, slide, { count: 3, force: true, tag: `topic|${topic}` });
       if (qs.length) {
         state.slide = n;
         state.queue = qs;
@@ -643,12 +872,12 @@ function handleQuiz(state, messages, { topic = null } = {}) {
   for (const slide of deck.slides) {
     const st = slideStats(state, slide.index);
     if (st.wrong > 0 && !slide.skipQuestions) {
-      const extra = buildQuestions(deck, slide, { count: 2, seed: `${state.seed}|revisit|${slide.index}` });
+      const extra = questionsFor(state, slide, { count: 3, force: true, tag: `revisit|${slide.index}` });
       for (const q of extra) if (!state.missed.includes(q.id)) missedPool.push(q);
     }
   }
   const currentSlide = slideOf(state, state.slide);
-  const fresh = state.plan.find(p => p.slide === state.slide)?.questions || [];
+  const fresh = questionsFor(state, currentSlide);
   const unseen = fresh.filter(q => !state.queue.includes(q));
   const pool = missedPool.length ? missedPool : (unseen.length ? unseen : buildQuestions(deck, currentSlide, { count: 4, seed: `${state.seed}|more|${state.slide}` }));
   if (!pool.length) {
@@ -686,7 +915,8 @@ function handleProgress(state, messages) {
 }
 
 function handleHelp(state, messages) {
-  messages.push(msg([
+  const hasCode = (state.index.deck.map?.codeSlides?.length || 0) > 0;
+  const lines = [
     '**Things you can say to me**',
     '- `next` · `back` · `repeat` — move between slides',
     '- `hint` · `show answer` · `skip` — when a question is not coming',
@@ -694,11 +924,19 @@ function handleHelp(state, messages) {
     '- `what is <term>?` · `where is <term> mentioned?` — ask about the content',
     '- `explain that simpler` · `give me an example` — when I have moved too fast',
     '- `summary` · `progress` · `glossary` — the bigger picture',
-    '- `quiz me` · `quiz me on my misses` — extra questions',
+    '- `agenda` · `objectives` — what this deck is meant to cover',
+    '- `quiz me` · `quiz me on my misses` · `study sheet` — extra practice and revision',
     '- `restart` — clear this run and start again',
-    '',
-    'I answer only from the file you uploaded — nothing else, and nothing leaves this browser.',
-  ].join('\n'), { kind: 'answer' }));
+  ];
+  if (hasCode) {
+    lines.push('');
+    lines.push('**Coding slides**');
+    lines.push('- `explain this code` — I walk the block line by line');
+    lines.push('- `code task` — prediction, fill-the-blank, spot-the-bug and write-it-from-memory drills');
+  }
+  lines.push('');
+  lines.push('I answer only from the file you uploaded — nothing else, and nothing leaves this browser.');
+  messages.push(msg(lines.join('\n'), { kind: 'answer', chips: hasCode ? [{ label: 'Code task', send: 'code task' }] : undefined }));
   return messages;
 }
 
@@ -807,6 +1045,50 @@ export function respond(state, text) {
 
     case 'quiz': return { messages: handleQuiz(state, messages), state };
 
+    case 'roadmap': {
+      const deck = state.index.deck;
+      const slide = deck.slides.find(s => s.role === ROLE.AGENDA) || deck.slides.find(s => s.role === ROLE.OBJECTIVES);
+      if (slide) messages.push(msg(slide.role === ROLE.AGENDA ? agendaMessage(state, slide) : objectivesMessage(state, slide), { kind: 'answer', slide: slide.index, card: true }));
+      else messages.push(msg('This deck has no agenda or objectives slide, so there is no plan to show. Say **summary** for what we have covered.', { kind: 'note' }));
+      return { messages, state };
+    }
+
+    case 'explain_code': {
+      const slide = slideOf(state, state.slide);
+      const block = slide?.code?.blocks?.[0];
+      if (!block) {
+        messages.push(msg('There is no code on this slide. Say **go to slide N** for a coding slide, or **code task** if the deck has some.', { kind: 'note' }));
+        return { messages, state };
+      }
+      messages.push(msg(codeIntro(state, slide), { kind: 'teach', slide: slide.index, card: true, chips: [{ label: 'Give me a task on it', send: 'code task' }, { label: 'Next slide', send: 'next' }] }));
+      return { messages, state };
+    }
+
+    case 'code_task': {
+      const slide = slideOf(state, state.slide);
+      const withCode = slide?.code?.blocks?.length ? slide : state.index.deck.slides.filter(s => s.code?.blocks?.length && !s.skipQuestions).find(s => s.index !== state.slide);
+      const target = withCode || slide;
+      if (!target?.code?.blocks?.length) {
+        messages.push(msg('There is no code in this deck for me to set a task on — upload your coding slides and I will drill you on them.', { kind: 'note' }));
+        return { messages, state };
+      }
+      const qs = questionsFor(state, target, { count: 8, force: true, tag: `code|${Date.now() % 100000}` })
+        .filter(q => q.type.startsWith('code_') || q.type === 'line_meaning');
+      if (!qs.length) {
+        messages.push(msg('I could not build a code task from that slide.', { kind: 'note' }));
+        return { messages, state };
+      }
+      state.slide = target.index;
+      state.queue = qs.slice(0, 4).map((q, i) => ({ ...q, index: i + 1, total: Math.min(4, qs.length) }));
+      state.qCursor = 0;
+      state.current = state.queue[0];
+      state.phase = 'question';
+      state.awaiting = 'answer';
+      messages.push(msg(`Coding practice on slide ${target.index} — ${target.code.lang.label}, ${target.code.blocks[0].size} lines.`, { kind: 'note', slide: target.index }));
+      messages.push(askMessage(state));
+      return { messages, state };
+    }
+
     case 'quiz_topic': return { messages: handleQuiz(state, messages, { topic: query }), state };
 
     case 'glossary': return { messages: handleGlossary(state, messages), state };
@@ -817,10 +1099,15 @@ export function respond(state, text) {
       const result = answerQuestion(state.index.deck, state.index, query, { lookupTerm: q => lookupTerm(state.index.deck.glossary, q) });
       if (result.hits.length) messages.push(passageAnswerMessage(state, result, query));
       else messages.push(noAnswerMessage(state, result, query));
+      nudgeOpenQuestion(state, messages);
       return { messages, state };
     }
 
-    case 'define': return { messages: handleDefine(state, query, messages), state };
+    case 'define': {
+      handleDefine(state, query, messages);
+      nudgeOpenQuestion(state, messages);
+      return { messages, state };
+    }
 
     case 'simpler': return { messages: handleSimpler(state, text, messages), state };
 
@@ -843,7 +1130,7 @@ export function respond(state, text) {
     case 'easier': {
       const slide = slideOf(state, state.slide);
       const preferHard = intent === 'harder';
-      const all = state.plan.find(p => p.slide === state.slide)?.questions || buildQuestions(state.index.deck, slide, { count: 8, seed: state.seed });
+      const all = questionsFor(state, slide, { count: 8 });
       const filtered = all.filter(q => preferHard ? q.difficulty >= 2 : q.difficulty <= 2);
       const pool = (filtered.length ? filtered : all).slice(0, 4);
       if (!pool.length) {
@@ -890,8 +1177,11 @@ export function respond(state, text) {
       messages.push(msg(`Any time${nameTag(state)}. ${state.awaiting === 'answer' ? 'The question is still open whenever you are ready.' : 'Say **next** and we will keep going.'}`, { kind: 'note' }));
       return { messages, state };
 
-    case 'question':
-      return { messages: handleDefine(state, query, messages), state };
+    case 'question': {
+      handleDefine(state, query, messages);
+      nudgeOpenQuestion(state, messages);
+      return { messages, state };
+    }
 
     default:
       messages.push(msg('I did not follow that one. Try **help** to see what I understand, or ask about something on the slide.', { kind: 'note' }));

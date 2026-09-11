@@ -4,6 +4,10 @@
 import {
   normalize, contentWords, keyStems, words, BOILERPLATE, STOPWORDS, truncate, isAcronym, uniqueBy, titleCase,
 } from './nlp.js';
+import { analyzeCode, isCodeLine, LANGUAGES } from './code.js';
+
+const DECK_LANGUAGES = Object.fromEntries(LANGUAGES.map(l => [l.id, l]));
+import { classifySlide, UNQUIZZABLE, buildRoadmap, buildObjectives, deckMap, ROLE } from './deck-intel.js';
 
 const DEF_VERBS = /\b(refers to|refer to|is defined as|are defined as|is known as|are known as|is called|are called|can be defined as|consists of|consist of|describes|describe|denotes|denote|means|mean|involves|involve|is|are)\b/i;
 
@@ -63,7 +67,33 @@ function splitByVerb(text) {
   if (contentWords(term).length < 1) return null;
   if (/[.?!]$/.test(term)) return null;
   if (words(rest).length < 3) return null;
+  if (!looksLikeTermPhrase(term)) return null;
   return { term, definition: `${verb} ${rest}`, kind: 'verb' };
+}
+
+/* A mined term has to look like a name for something, not a whole clause. Sentences such as
+   "Reading a slide again feels productive but it is mostly recognition" are prose, not
+   definitions — accepting them gives the tutor nonsense terms to quiz. */
+const NOT_A_TERM_WORD = new Set(['feels', 'feel', 'seem', 'seems', 'look', 'looks', 'sounds', 'sound',
+  'carry', 'carries', 'reply', 'replies', 'click', 'click', 'type', 'types', 'upload', 'uploads',
+  'remember', 'remembers', 'forget', 'forgets', 'happens', 'happen', 'goes', 'go', 'comes', 'come',
+  'works', 'work', 'gives', 'give', 'takes', 'take', 'makes', 'make', 'does', 'do', 'becomes', 'become']);
+const PRONOUN_WORD = new Set(['it', 'its', 'they', 'them', 'their', 'this', 'that', 'these', 'those',
+  'you', 'your', 'yours', 'we', 'our', 'ours', 'i', 'me', 'my', 'mine', 'he', 'she', 'him', 'her',
+  'there', 'here', 'which', 'who', 'whom', 'whose', 'some', 'many', 'most', 'all', 'both', 'each',
+  'one', 'thing', 'things', 'stuff', 'anything', 'something', 'nothing', 'everything', 'someone']);
+
+function looksLikeTermPhrase(term) {
+  const w = words(term).map(x => x.toLowerCase());
+  if (!w.length || w.length > 6) return false;
+  if (term.length > 52) return false;
+  if (w.some(x => PRONOUN_WORD.has(x))) return false;       // "Nothing here", "... but it"
+  if (w.some(x => NOT_A_TERM_WORD.has(x))) return false;     // a verb means this is a clause
+  if (/[,;]$/.test(term.trim())) return false;
+  // Don't let an entire sentence act as a name: too many ordinary lowercase words in a row.
+  const lowercaseRun = term.split(/\s+/).filter(x => /^[a-z][a-z'-]*$/.test(x) && !STOPWORDS.has(x.toLowerCase())).length;
+  if (lowercaseRun >= 5) return false;
+  return true;
 }
 
 /** "Full Name (ACR)" → acronym term with its expansion as the definition. */
@@ -99,18 +129,8 @@ function titleCaseConcepts(text) {
   return uniqueBy(out, p => p.toLowerCase());
 }
 
-/** Code, formulas and file paths make poor quiz terms — recognise and set them aside. */
-export function looksLikeCode(text = '') {
-  const t = normalize(text);
-  if (!t) return false;
-  if (/[{};]|\bSystem\.out\b|\w+\.\w+\(|\)\s*\{|=>|::|;\s*$/.test(t)) return true;
-  if (/(?:^|\s)(?:int|float|double|char|bool|boolean|String|void|var|let|const|def|class|return|print|printf|scanf|import|public|private|static)\s+\w+/.test(t)) return true;
-  if (/^\s*[\w.]+\([^)]*\)\s*[;{]?$/.test(t)) return true;    // bare call: foo(bar);
-  if (/^[<>!=+\-*/%&|^]+\s/.test(t)) return true;              // operators
-  if (/\w+_\w+|\w+\.\w+\.\w+|[a-z][A-Z]\w+\(/.test(t)) return true; // snake_case, a.b.c, camelCase(
-  if (/\b\d+\.\d+\b.*[=<>]/.test(t)) return true;              // comparisons
-  return false;
-}
+/** Code, formulas and file paths make poor quiz terms — the real detector lives in code.js. */
+export const looksLikeCode = isCodeLine;
 
 export function findNumbers(text) {
   const out = [];
@@ -196,8 +216,8 @@ export function analyzeSlide(slide, deckCtx = {}) {
     if (!cleaned || cleaned.length < 2 || cleaned.length > 70) return;
     if (GENERIC_TERMS.has(cleaned.toLowerCase()) || BOILERPLATE.has(cleaned.toLowerCase())) return;
     if (!contentWords(cleaned).length && !isAcronym(cleaned)) return;
-    if (looksLikeCode(cleaned)) return;
-    if (!t.definition && t.sourceLine && looksLikeCode(t.sourceLine)) return;
+    if (isCodeLine(cleaned)) return;
+    if (!t.definition && t.sourceLine && isCodeLine(t.sourceLine)) return;
     const definition = (t.definition || '').trim();
     const cand = {
       term: cleaned,
@@ -276,10 +296,13 @@ export function analyzeSlide(slide, deckCtx = {}) {
   const quotaWords = new Set([...contentWords(title), ...kept.flatMap(t => contentWords(t.term))]);
   const topicStems = [...new Set([...keyStems(title), ...keyStems(bodyText)])].slice(0, 24);
 
-  const codeLines = lines.filter(l => looksLikeCode(l.text)).length;
-  const storyLines = lines.filter(l => words(l.text).length >= 4).length;
-  const thin = storyLines < 2 && !kept.some(t => t.definition);
-  const skipQuestions = thin || (SKIP_TITLE_RE.test(title) && !kept.some(t => t.definition)) || (facts.length === 0 && !kept.some(t => t.definition));
+  // Code on the slide is teachable material in its own right — never throw it away.
+  const code = analyzeCode(lines, slide.notes || '');
+  const codeLines = code.codeLineCount;
+  const storyLines = lines.filter(l => words(l.text).length >= 4 && !isCodeLine(l.text)).length;
+  const hasMaterial = facts.length >= 1 || kept.some(t => t.definition) || code.blocks.length > 0;
+  const thin = !hasMaterial || (storyLines < 2 && !kept.some(t => t.definition) && code.codeLineCount < 3);
+  const skipQuestions = thin || (SKIP_TITLE_RE.test(title) && !kept.some(t => t.definition) && code.blocks.length === 0);
 
   return {
     index: slide.index,
@@ -300,13 +323,36 @@ export function analyzeSlide(slide, deckCtx = {}) {
     source: slide.source,
     width: slide.width,
     height: slide.height,
+    code,
     codeHeavy: lines.length > 2 && codeLines / lines.length > 0.5,
+    role: null,
+    roleWhy: '',
     skipQuestions,
   };
 }
 
 export function analyzeDeck(parsed) {
   const slides = (parsed.slides || []).map(s => analyzeSlide(s));
+
+  // What each slide is FOR (cover, agenda, objectives, section, content, code, exercise…).
+  slides.forEach((s, i) => {
+    const verdict = classifySlide(s, i + 1, slides.length);
+    s.role = verdict.role;
+    s.roleWhy = verdict.why || '';
+    s.roleDetail = verdict;
+  });
+  for (const s of slides) {
+    if (UNQUIZZABLE.has(s.role)) { s.skipQuestions = true; continue; }
+    if (s.role === ROLE.CODE && !s.code.blocks.length) { s.skipQuestions = true; continue; }
+    // A thin prose slide is fine when it carries code to work through.
+    if (s.skipQuestions && !s.code.blocks.length) continue;
+    if (s.code.blocks.length) s.skipQuestions = false;
+    const codable = s.code.blocks.length > 0
+      || s.facts.length >= 1
+      || s.terms.some(t => t.definition);
+    if (!codable) s.skipQuestions = true;
+  }
+
   const glossary = new Map();
   for (const s of slides) {
     for (const t of s.terms) {
@@ -322,14 +368,45 @@ export function analyzeDeck(parsed) {
   const termsWithDefs = [...glossary.values()].filter(t => t.definition).length;
   const teachable = slides.filter(s => !s.skipQuestions).length;
   const deckTitle = (() => {
+    const cover = slides.find(s => s.role === ROLE.COVER && words(s.title).length >= 2);
+    if (cover) return cover.title;
     const first = slides.find(s => s.title && !SKIP_TITLE_RE.test(s.title) && words(s.title).length >= 2);
     return first ? first.title : (slides[0]?.title || 'Untitled lesson');
   })();
+
+  const roadmap = buildRoadmap({ slides });
+  const objectives = buildObjectives({ slides });
+  const map = deckMap({ slides });
+  const languages = new Map();
+  for (const s of slides) {
+    if (s.code?.blocks?.length && s.code.lang.id !== 'unknown') {
+      languages.set(s.code.lang.id, (languages.get(s.code.lang.id) || 0) + 1);
+    }
+  }
+  // Blocks that carry no language signal inherit the deck's dominant language
+  // (a Java lecture's `do { } while(x);` line is still Java).
+  const dominant = [...languages.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
+  if (dominant) {
+    const lang = DECK_LANGUAGES[dominant] || { id: dominant, label: dominant, ext: '.txt' };
+    for (const s of slides) {
+      if (!s.code?.blocks?.length || s.code.lang.id !== 'unknown') continue;
+      s.code.lang = { id: lang.id, label: lang.label, ext: lang.ext, score: 0, inherited: true };
+      for (const b of s.code.blocks) {
+        b.lang = lang.id;
+        b.langLabel = lang.label;
+        b.ext = lang.ext;
+      }
+    }
+  }
+
   return {
     kind: parsed.kind,
     slides,
     glossary,
     deckTitle,
+    roadmap,
+    objectives,
+    map,
     stats: {
       slides: slides.length,
       teachable,
@@ -338,6 +415,11 @@ export function analyzeDeck(parsed) {
       facts: slides.reduce((n, s) => n + s.facts.length, 0),
       questions: slides.reduce((n, s) => n + estimateQuestions(s), 0),
       imagesOnly: slides.filter(s => s.skipQuestions).length,
+      codeSlides: map.codeSlides.length,
+      languages: [...languages.keys()],
+      roles: map.counts,
+      roadmap: roadmap.length,
+      objectives: objectives.length,
     },
   };
 }
@@ -347,7 +429,8 @@ export function estimateQuestions(slide) {
   if (slide.skipQuestions) return 0;
   const defs = slide.terms.filter(t => t.definition).length;
   const facts = slide.facts.length;
-  return Math.max(1, Math.min(8, defs * 2 + Math.min(3, Math.floor(facts / 2)) + slide.lists.length));
+  const code = slide.code?.blocks?.length ? 3 + Math.min(3, slide.code.blocks[0].lines.length) : 0;
+  return Math.max(1, Math.min(9, defs * 2 + Math.min(3, Math.floor(facts / 2)) + slide.lists.length + code));
 }
 
 /** Look a term up in the deck glossary, tolerating near-misses in how the student phrases it. */

@@ -5,7 +5,8 @@ import { words, keyStems, stem, normalize, similarity, coverAnswer, truncate } f
 
 const YES = /^(y|ye|yes|yep|yeah|true|t|correct|right|sure|affirmative|it is|that's right|indeed)\b/i;
 const NO = /^(n|no|nope|nah|false|f|incorrect|wrong|not|negative|that's wrong)\b/i;
-const IDLE = /^(i\s*(don'?t|do not)\s*know|no idea|dunno|not sure|i'?m not sure|idk|\?+|pass|skip it|i give up|help)\b/i;
+/* Anchored at both ends on purpose: "Pass 0 Pass 1 Pass 2" is program output, not "I give up". */
+const IDLE = /^(?:i\s*(?:don'?t|do not)\s*know|i\s*have no idea|no idea|dunno|i'?m not sure|not sure|idk|i give up|give up|skip it|pass|\?+|help)\s*[.!?…]*$/i;
 
 function letterIndex(resp, n) {
   const m = normalize(resp).match(/^(?:option\s*)?([a-h])(?:[).:]|\s|$)/i);
@@ -24,16 +25,28 @@ function letterIndex(resp, n) {
 function multiChoiceVerdict(question, response) {
   const choices = question.choices;
   const text = normalize(response);
-  const idx = letterIndex(text, choices.length);
-  let picked = idx >= 0 ? idx : -1;
+  let picked = -1;
+
+  // 1. An answer that matches one of the options by text wins over letter/number shorthand:
+  //    otherwise "2" would be read as "option 2" when the real answer is the value 2.
+  const exact = choices.findIndex(c => normalize(c.text).toLowerCase() === text.toLowerCase());
+  if (exact >= 0) picked = exact;
   if (picked < 0) {
     let best = { i: -1, score: 0 };
     choices.forEach((c, i) => {
       const s = similarity(c.text, text);
       if (s > best.score) best = { i, score: s };
     });
-    if (best.score >= 0.6) picked = best.i;
+    if (best.score >= 0.72) picked = best.i;
   }
+
+  // 2. Otherwise treat it as an option reference ("b", "option 3", "3").
+  if (picked < 0) {
+    const stripped = text.replace(/^option\s*/i, '');
+    const idx = letterIndex(stripped, choices.length);
+    if (idx >= 0) picked = idx;
+  }
+
   if (picked < 0) return { verdict: 'unsure', score: 0, note: 'I could not tell which option you meant — answer with a letter or copy the option text.' };
   const chosen = choices[picked];
   const correctIdx = choices.findIndex(c => c.correct);
@@ -96,6 +109,72 @@ function termVerdict(question, response) {
   return { verdict: 'incorrect', score: 0 };
 }
 
+function numericVerdict(question, response) {
+  const target = question.answer.numeric ?? parseFloat(String(question.answer.text).replace(/[^\d.-]/g, ''));
+  const wordsMap = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10, twenty: 20, fifty: 50, hundred: 100 };
+  let given = parseFloat(normalize(response).replace(/[^\d.-]/g, ''));
+  if (!Number.isFinite(given)) given = wordsMap[normalize(response).toLowerCase().trim()];
+  if (!Number.isFinite(given) || !Number.isFinite(target)) return { verdict: 'unsure', score: 0, note: `Give me a number.` };
+  if (given === target) return { verdict: 'correct', score: 1 };
+  return { verdict: 'incorrect', score: 0, note: `I was looking for ${target}.` };
+}
+
+function codeOutputVerdict(question, response) {
+  const expected = question.answer.sequence || [];
+  const given = normalize(response).toLowerCase();
+  if (!expected.length) {
+    const sim = similarity(question.answer.text, response);
+    return { verdict: sim >= 0.7 ? 'correct' : sim >= 0.4 ? 'partial' : 'incorrect', score: sim };
+  }
+  // Whole-sequence match first ("Pass 0 Pass 1 Pass 2" written out in one go).
+  const joined = normalize(expected.join(' ')).toLowerCase();
+  const squash = s => s.replace(/[^a-z0-9+.-]+/g, '');
+  if (squash(given) === squash(joined) || squash(given).includes(squash(joined))) {
+    return { verdict: 'correct', score: 1 };
+  }
+  // Otherwise match each expected output in order, allowing multi-word outputs.
+  const tokens = normalize(given).split(/[^a-z0-9.'"+-]+/i).filter(Boolean);
+  let cursor = 0;
+  let hit = 0;
+  for (const item of expected) {
+    const want = normalize(item).toLowerCase().split(/\s+/).filter(Boolean);
+    let found = false;
+    for (let start = cursor; start + want.length <= tokens.length; start++) {
+      if (want.every((w, k) => tokens[start + k] === w)) { cursor = start + want.length; found = true; break; }
+    }
+    if (found) hit++;
+  }
+  const score = hit / expected.length;
+  if (score >= 0.9) return { verdict: 'correct', score };
+  if (score >= 0.4) return { verdict: 'partial', score, note: `You had ${hit} of the ${expected.length} lines right, and they have to be in order.` };
+  return { verdict: 'incorrect', score };
+}
+
+function codeErrorVerdict(question, response) {
+  const t = normalize(response).toLowerCase();
+  const wants = question.answer.keywords || [];
+  const hits = wants.filter(k => t.includes(k)).length;
+  const lineNo = (question.answer.also || [])[0];
+  const rightLine = lineNo ? new RegExp(`\\bline\\s*${lineNo}\\b|\\b${lineNo}(?:st|nd|rd|th)\\b`).test(t) : false;
+  if (hits >= 2 || (rightLine && hits >= 1)) return { verdict: 'correct', score: 1 };
+  if (hits >= 1 || rightLine) return { verdict: 'partial', score: 0.5 };
+  return { verdict: 'incorrect', score: 0 };
+}
+
+function codeRecallVerdict(question, response) {
+  const target = question.answer.codeLine || question.answer.text;
+  const got = normalize(response);
+  const sim = similarity(target, got);
+  const tokens = (question.answer.keywords || []);
+  const gotTokens = new Set(keyStems(got));
+  const hit = tokens.filter(k => gotTokens.has(stem(k))).length;
+  const coverage = tokens.length ? hit / tokens.length : 0;
+  const hasFirstToken = got.toLowerCase().includes(String(question.answer.firstToken || '').toLowerCase());
+  if (sim >= 0.82 || (coverage >= 0.6 && hasFirstToken)) return { verdict: 'correct', score: 1 };
+  if (sim >= 0.55 || (coverage >= 0.3 && hasFirstToken)) return { verdict: 'partial', score: 0.5, note: 'Close — check the punctuation and the exact wording.' };
+  return { verdict: 'incorrect', score: 0 };
+}
+
 /**
  * @returns {{verdict:'correct'|'partial'|'incorrect'|'unsure', score:number, note?:string, missing?:string[]}}
  */
@@ -107,6 +186,10 @@ export function gradeAnswer(question, response) {
   switch (question.type) {
     case 'true_false': return trueFalseVerdict(question, resp);
     case 'cloze_type': return termVerdict(question, resp);
+    case 'code_count': return numericVerdict(question, resp);
+    case 'code_output': return codeOutputVerdict(question, resp);
+    case 'code_error': return codeErrorVerdict(question, resp);
+    case 'code_recall': return codeRecallVerdict(question, resp);
     case 'define_short':
     case 'gist_short':
     case 'list_recall': return coverageVerdict(question, resp);

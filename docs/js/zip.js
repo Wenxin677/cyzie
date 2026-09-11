@@ -1,6 +1,8 @@
 /* Minimal ZIP (and therefore OOXML) reader — no dependencies.
    Uses the platform DecompressionStream for deflate payloads (Chrome 80+, Edge, Safari 16.4+, Node 18+). */
 
+import { LIMITS } from './limits.js';
+
 const utf8 = new TextDecoder('utf-8');
 
 function findEOCD(view, len) {
@@ -35,6 +37,11 @@ export async function openZip(buffer) {
   let offset = view.getUint32(eocd + 16, true);
   const entries = new Map();
 
+  if (count > LIMITS.maxZipEntries) {
+    throw new Error(`This archive has ${count} parts — more than Cyzie will read safely.`);
+  }
+  let declaredTotal = 0;
+
   for (let i = 0; i < count; i++) {
     if (offset + 46 > bytes.byteLength || view.getUint32(offset, true) !== 0x02014b50) break;
     const method = view.getUint16(offset + 10, true);
@@ -45,12 +52,21 @@ export async function openZip(buffer) {
     const commentLen = view.getUint16(offset + 32, true);
     const localOffset = view.getUint32(offset + 42, true);
     const name = utf8.decode(bytes.subarray(offset + 46, offset + 46 + nameLen));
+    // Refuse parts that claim to inflate beyond the limits — a zip bomb defence.
+    if (rawSize > LIMITS.maxEntryBytes) {
+      throw new Error(`“${name}” unpacks to ${Math.round(rawSize / 1048576)} MB — larger than Cyzie will decompress.`);
+    }
+    declaredTotal += rawSize;
+    if (declaredTotal > LIMITS.maxTotalBytes) {
+      throw new Error('This file unpacks to more data than Cyzie will decompress.');
+    }
     // Zip64 escape values (0xFFFFFFFF) — we only support the normal sizes.
     entries.set(name, { name, method, compSize, rawSize, localOffset });
     offset += 46 + nameLen + extraLen + commentLen;
   }
 
   const cache = new Map();
+  let liveBytes = 0;
 
   async function readBytes(name) {
     if (cache.has(name)) return cache.get(name);
@@ -63,9 +79,11 @@ export async function openZip(buffer) {
     const start = lo + 30 + lnameLen + lextraLen;
     const raw = bytes.subarray(start, start + (e.compSize || e.rawSize));
     let out;
-    if (e.method === 0) out = raw.slice();
+    if (e.method === 0) out = raw.slice(0, Math.min(raw.length, LIMITS.maxEntryBytes));
     else if (e.method === 8) out = await inflateRaw(raw);
     else throw new Error(`Unsupported zip compression method ${e.method} in ${name}`);
+    liveBytes += out.length;
+    if (liveBytes > LIMITS.maxTotalBytes) throw new Error('This file unpacks to more data than Cyzie will hold in memory.');
     cache.set(name, out);
     return out;
   }

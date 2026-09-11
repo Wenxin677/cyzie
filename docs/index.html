@@ -3,9 +3,14 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Cyzie is fully self-contained: no CDN, no analytics, no network calls at runtime.
+     This policy enforces that claim in the browser: scripts and styles come from this
+     origin only, connections are blocked outright, and images are limited to local,
+     data: and blob: URLs. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; worker-src 'self' blob:; style-src 'self'; img-src 'self' data: blob:; font-src 'self'; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'">
 <title>Cyzie — slide-by-slide tutor</title>
 <meta name="description" content="Cyzie reads your lecture slides and teaches them back to you, one page at a time, with questions — entirely inside your browser.">
-<link rel="stylesheet" href="css/app.css?v=4">
+<link rel="stylesheet" href="css/app.css?v=11">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%231f6f5c'/%3E%3Ctext x='16' y='23' font-family='Georgia,serif' font-size='20' fill='%23fff' text-anchor='middle'%3EC%3C/text%3E%3C/svg%3E">
 </head>
 <body>
@@ -25,17 +30,17 @@
 
     <nav class="library" aria-label="Your lessons">
       <h2 class="side-head">Your lessons</h2>
-      <ul id="lessonList" style="list-style:none;margin:0;padding:0;display:grid;gap:2px;"></ul>
+      <ul id="lessonList" class="lesson-list"></ul>
       <p class="side-empty" id="libraryEmpty">No lessons yet. Upload a PDF or PowerPoint and Cyzie will build the lesson from it.</p>
     </nav>
 
     <div class="side-foot">
-      <div class="side-actions">
-        <button type="button" data-role="settings">Settings</button>
-        <button type="button" data-role="theme">Dark mode</button>
-        <button type="button" data-role="clear">Clear data</button>
+      <div class="foot-row">
+        <button type="button" data-role="settings" title="Study pace, name, theme">Settings</button>
+        <button type="button" data-role="theme" id="themeToggle" title="Switch between light and dark">Dark</button>
+        <button type="button" data-role="clear" title="Delete every lesson stored in this browser">Clear data</button>
       </div>
-      <p class="privacy">Your files are read inside this browser. Nothing is uploaded, and nothing is sent to a server.</p>
+      <p class="foot-note">Read inside this browser only — nothing uploaded, no server.</p>
     </div>
   </aside>
 
@@ -45,15 +50,16 @@
       <div class="topbar-meta">
         <h1 id="lessonTitle">No lesson loaded</h1>
         <div class="topbar-sub">
-          <span id="slideIndicator">Sample lesson</span>
+          <span id="slideIndicator"></span>
           <span id="progressText"></span>
         </div>
       </div>
       <div class="topbar-actions">
-        <button class="icon-btn" id="prevSlideBtn" type="button" aria-label="Previous slide" title="Previous slide">‹</button>
-        <button class="icon-btn" id="nextSlideBtn" type="button" aria-label="Next slide" title="Next slide">›</button>
-        <button class="icon-btn" id="panelBtn" type="button" aria-label="Toggle slide panel" title="Slide panel">Slide</button>
-        <button class="icon-btn" id="themeBtn" type="button" aria-label="Toggle theme" title="Light / dark">◐</button>
+        <div class="slide-nav" id="slideNav" hidden>
+          <button class="icon-btn" id="prevSlideBtn" type="button" aria-label="Previous slide" title="Previous slide">‹</button>
+          <button class="icon-btn" id="nextSlideBtn" type="button" aria-label="Next slide" title="Next slide">›</button>
+        </div>
+        <button class="icon-btn" id="panelBtn" type="button" aria-label="Show or hide the slide panel" title="Slide panel">Panel</button>
       </div>
       <div class="progress-track" aria-hidden="true"><div class="progress-fill" id="progressFill"></div></div>
     </header>
@@ -61,23 +67,61 @@
     <section class="chat" id="chat" aria-label="Conversation">
       <div class="chat-inner">
         <div class="empty-state" id="emptyState">
-          <h2>Cyzie</h2>
-          <p class="lede">Upload a lesson file. Cyzie reads every slide, teaches them to you one at a time, questions you on each one, and answers whatever you ask — straight from your file.</p>
-          <div class="dropzone" id="dropzone">
-            <div>
-              <div class="dz-title">Drop slides here</div>
-              <div class="dz-sub">PowerPoint (.pptx), PDF, Word (.docx), or plain text / markdown. Read locally — the file never leaves your device.</div>
+          <div class="welcome">
+            <div class="welcome-head">
+              <div class="welcome-mark" aria-hidden="true">
+                <span class="halo"></span>
+                <span class="ring"></span>
+                <span class="core">C</span>
+              </div>
+              <div>
+                <h2 id="welcomeGreeting">Hello.</h2>
+                <p class="lede" id="welcomeLede">I am Cyzie. Give me your lecture slides and I will teach them to you one slide at a time — explaining each page, questioning you on it, and answering whatever you ask, straight from your file.</p>
+              </div>
             </div>
-            <div class="dz-actions">
-              <button class="btn-primary" id="pickFileBtn" type="button">Choose a file</button>
-              <button class="btn-secondary" id="sampleBtn" type="button">Try the sample lesson</button>
+
+            <div class="welcome-drop dropzone" id="dropzone">
+              <div class="dz-row">
+                <span class="dz-icon" aria-hidden="true">↥</span>
+                <div>
+                  <div class="dz-title">Drop your slides here</div>
+                  <div class="dz-sub" id="dzSub">PowerPoint (.pptx), PDF, Word (.docx), or plain text / markdown · up to 60 MB</div>
+                </div>
+              </div>
+              <div class="welcome-actions">
+                <button class="btn-primary" id="pickFileBtn" type="button">Choose a file</button>
+                <button class="btn-secondary" id="sampleBtn" type="button">Try the sample lesson</button>
+                <button class="btn-secondary" id="helpBtn" type="button">How does it work?</button>
+              </div>
             </div>
+
+            <div class="suggest" id="suggestions">
+              <button type="button" data-say="What can you do?">What can you do?</button>
+              <button type="button" data-say="I am learning Python">I am learning Python</button>
+              <button type="button" data-say="I am learning Java">I am learning Java</button>
+              <button type="button" data-say="How should I revise for my exam?">How should I revise?</button>
+            </div>
+
+            <ol class="welcome-steps">
+              <li>
+                <span class="step-n">STEP 01</span>
+                <strong>One slide at a time</strong>
+                I show you the page, explain what is on it — code included, line by line — then ask you about it.
+              </li>
+              <li>
+                <span class="step-n">STEP 02</span>
+                <strong>Questions from your slides</strong>
+                Multiple choice, fill-in-the-blank, true/false, recall — plus predict-the-output and spot-the-bug on code.
+              </li>
+              <li>
+                <span class="step-n">STEP 03</span>
+                <strong>Ask me anything</strong>
+                Every answer cites the slide it came from. If your file does not cover it, I say so instead of guessing.
+              </li>
+            </ol>
+
+                <p class="welcome-foot">Your file is read inside this browser and never uploaded. No server, no account, no tracking.</p>
           </div>
-          <ul class="facts">
-            <li><strong>One slide at a time</strong>Cyzie explains the page, then asks you about it. You can ask anything back at any moment.</li>
-            <li><strong>Questions from your slides</strong>Multiple choice, fill-in-the-blank, true/false and open recall — all generated from the words on the page.</li>
-            <li><strong>Answers with citations</strong>Every reply points to the slide it came from. If the deck does not cover something, Cyzie says so.</li>
-          </ul>
         </div>
         <ol class="messages" id="messages"></ol>
       </div>
@@ -95,6 +139,12 @@
 
   <aside class="context" id="context" aria-label="Slide detail">
     <div class="context-inner" id="contextInner">
+      <div class="panel-empty" id="panelEmpty">
+        <div class="panel-empty-mark" aria-hidden="true">C</div>
+        <strong>Nothing open yet</strong>
+        <p>Upload your slides and this panel follows along — each page as it is taught, its key terms, and your questions on it.</p>
+      </div>
+      <div class="panel-body" id="panelBody" hidden>
       <h2>Current slide</h2>
       <div class="slide-card" id="slideCard">
         <header><strong id="slideCardTitle">—</strong><span id="slideCardNum"></span></header>
@@ -103,10 +153,11 @@
       </div>
       <h2>Questions on this slide</h2>
       <div class="qdots" id="qdots"></div>
-      <h2>Key terms here</h2>
+      <h2>Key terms on this slide</h2>
       <ul class="term-list" id="termList"></ul>
       <h2>Jump to a slide</h2>
       <div class="slide-strip" id="slideStrip"></div>
+      </div>
     </div>
   </aside>
 </div>
@@ -139,6 +190,6 @@
 
 <input type="file" id="fileInput" accept=".pdf,.pptx,.docx,.txt,.md,.markdown" hidden>
 
-<script type="module" src="js/app.js?v=5"></script>
+<script type="module" src="js/app.js?v=24"></script>
 </body>
 </html>

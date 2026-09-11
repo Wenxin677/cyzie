@@ -2,6 +2,9 @@
    Escapes HTML first, so slide text can never inject markup. */
 
 import { escapeHtml } from './nlp.js';
+import { highlightCode } from './code.js';
+
+const LANG_LABEL = { python: 'Python', java: 'Java', javascript: 'JavaScript', c: 'C', cpp: 'C++', csharp: 'C#', sql: 'SQL', html: 'HTML', css: 'CSS', shell: 'Shell', unknown: 'Code' };
 
 export function renderMarkdown(src = '') {
   const lines = String(src).replace(/\r\n?/g, '\n').split('\n');
@@ -9,6 +12,7 @@ export function renderMarkdown(src = '') {
   let list = null;      // 'ul' | 'ol'
   let quote = false;
   let para = [];
+  let fence = null;     // {lang, code: []}
 
   const flushPara = () => {
     if (para.length) {
@@ -22,9 +26,37 @@ export function renderMarkdown(src = '') {
   const closeQuote = () => {
     if (quote) { out.push('</blockquote>'); quote = false; }
   };
+  const flushFence = () => {
+    if (!fence) return;
+    const lang = (fence.lang || 'unknown').toLowerCase();
+    const code = fence.code.join('\n');
+    const label = LANG_LABEL[lang] || 'Code';
+    out.push(
+      `<div class="code-block" data-lang="${escapeHtml(lang)}">`
+      + `<div class="code-head"><span class="code-lang">${escapeHtml(label)}</span>`
+      + `<button class="code-copy" type="button" data-copy>Copy</button></div>`
+      + `<pre class="code"><code>${highlightCode(code, lang)}</code></pre>`
+      + `</div>`,
+    );
+    fence = null;
+  };
 
   for (const raw of lines) {
     const line = raw.replace(/\s+$/, '');
+
+    // Fenced code blocks come first: nothing inside them is markdown.
+    const fenceStart = line.match(/^\s*```+\s*([\w+#-]*)\s*$/);
+    if (fence) {
+      if (fenceStart) { flushFence(); continue; }
+      fence.code.push(raw);
+      continue;
+    }
+    if (fenceStart) {
+      flushPara(); closeList(); closeQuote();
+      fence = { lang: fenceStart[1] || 'unknown', code: [] };
+      continue;
+    }
+
     if (!line.trim()) { flushPara(); closeList(); closeQuote(); continue; }
 
     const heading = line.match(/^(#{1,4})\s+(.*)$/);
@@ -63,7 +95,7 @@ export function renderMarkdown(src = '') {
     closeList(); closeQuote();
     para.push(line.trim());
   }
-  flushPara(); closeList(); closeQuote();
+  flushPara(); closeList(); closeQuote(); flushFence();
   return out.join('');
 }
 

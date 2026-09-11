@@ -200,11 +200,16 @@ async function run() {
   await say('hint');
   check('"hint" responds with a hint', /not |leaves|starts with|Check the wording|Work these|items|Look again/i.test(bodyText().slice(-500)), bodyText().slice(-160));
 
+  // Assert against the live question's real answer rather than a slide-number string: the
+  // message after the reveal may be the next question, which need not name the slide.
+  const pendingAnswer = (win.CyzieApp.state.lesson.session.current?.answer?.text || '').replace(/\s+/g, ' ').trim();
+  const answerProbe = pendingAnswer.split(' ').slice(0, 4).join(' ').slice(0, 26);
   await say('show answer');
-  check('"show answer" reveals the slide answer', /slide 3|Slide 3/.test(bodyText().slice(-700)), bodyText().slice(-200));
+  const revealed = !answerProbe || await until(() => bodyText().toLowerCase().includes(answerProbe.toLowerCase()), { timeout: 8000 });
+  check('"show answer" reveals the slide answer', revealed, `looked for "${answerProbe || '(none)'}" in ${bodyText().slice(-160)}`);
 
   await say('summarise this slide');
-  check('"summarise this slide" produces a slide summary', /Slide 3|Key|summary|done/i.test(bodyText().slice(-800)));
+  check('"summarise this slide" produces a slide summary', /slide\s*3|Key|summary|done/i.test(bodyText().slice(-800)));
 
   await say('what does spaced repetition mean?');
   const cited = await until(() => /Slide \d/.test(bodyText().slice(-900)) && /spaced repetition/i.test(bodyText().slice(-900)), { timeout: 10000 });
@@ -239,8 +244,10 @@ async function run() {
   /* --------------------------------------------------- 7. question audit --- */
   const questionMessages = win.CyzieApp.state.lesson.messages.filter(m => m.kind === 'question');
   check('question messages carry ids and slides', questionMessages.every(m => m.questionId && m.slide), JSON.stringify(questionMessages[0] || {}));
-  const allQuestions = win.CyzieApp.state.lesson.session.plan.flatMap(p => p.questions);
-  check('every planned question has an answer', allQuestions.every(x => x.answer && x.answer.text), `${allQuestions.length} questions`);
+  const planEntries = win.CyzieApp.state.lesson.session.plan;
+  const allQuestions = planEntries.flatMap(p => p.questions || []);   // the plan is lazy: only visited slides have questions
+  check('question sets are built on arrival, not up front', planEntries.some(p => p.questions === null), `${planEntries.filter(p => p.questions === null).length}/${planEntries.length} still unbuilt`);
+  check('every built question has an answer', allQuestions.every(x => x.answer && x.answer.text), `${allQuestions.length} questions`);
   check('every question cites a real slide', allQuestions.every(x => win.CyzieApp.state.lesson.deck.slides.some(s => s.index === x.slide)));
   check('MCQ options are unique and single-answer', allQuestions.filter(x => x.choices).every(x => {
     const l = x.choices.map(c => c.text.toLowerCase());
@@ -282,14 +289,15 @@ async function run() {
   check('restored session keeps its progress', session2.stats.answered >= 1, JSON.stringify(session2.stats));
   check('restored session keeps the slide position', session2.slide === 3, `slide=${session2.slide}`);
   check('restored session still accepts input', session2.awaiting === 'answer' || session2.phase !== 'done', `${session2.awaiting}/${session2.phase}`);
-  check('restored transcript shows the slide Cyzie taught', /Spaced Repetition|Slide 3/.test(doc2.body.textContent), doc2.body.textContent.slice(-160));
+  check('restored transcript shows the slide Cyzie taught', /Spaced Repetition|slide\s*3/i.test(doc2.body.textContent), doc2.body.textContent.slice(-160));
 
   /* ------------------------------------------------ 9. real upload paths --- */
   const win2 = frame.contentWindow;
   const doc3 = win2.document;
   const mdText = await (await fetch('../tests/fixtures/sample-notes.md')).text();
   const mdFile = new win2.File([mdText], 'sample-notes.md', { type: 'text/markdown' });
-  win2.CyzieApp.ingestFile(mdFile);
+  await win2.CyzieApp.ingestFile(mdFile);
+  await until(() => win2.CyzieApp.state.busy === false, { timeout: 30000 });
   const mdLesson = await until(() => {
     const l = win2.CyzieApp.state.lesson;
     return l?.fileName === 'sample-notes.md' ? l : null;
@@ -301,7 +309,8 @@ async function run() {
 
   const pptxBuf = await (await fetch('../tests/fixtures/sample.pptx')).arrayBuffer();
   const pptxFile = new win2.File([pptxBuf], 'sample.pptx', { type: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' });
-  win2.CyzieApp.ingestFile(pptxFile);
+  await win2.CyzieApp.ingestFile(pptxFile);
+  await until(() => win2.CyzieApp.state.busy === false, { timeout: 30000 });
   const pptxLesson = await until(() => {
     const l = win2.CyzieApp.state.lesson;
     return l?.fileName === 'sample.pptx' ? l : null;
@@ -321,13 +330,14 @@ async function run() {
   check('.pptx context pane lists mined terms', paneTerms, [...doc3.querySelectorAll('#termList .t-name')].map(n => n.textContent).join(','));
 
   const badFile = new win2.File(['hello'], 'notes.rtf', { type: 'application/rtf' });
-  win2.CyzieApp.ingestFile(badFile);
+  await win2.CyzieApp.ingestFile(badFile);
   check('an unsupported file type is rejected with an explanation', /Cyzie reads/i.test(text(doc3.querySelector('.notice'))), text(doc3.querySelector('.notice')).slice(0, 120));
 
-  /* ---------------------------------------------- 9b. pdf upload path --- */
+  /* ------------------------------------------- 9c. pdf upload path --- */
   const pdfBuf = await (await fetch('../tests/fixtures/sample.pdf')).arrayBuffer();
   const pdfFile = new win2.File([pdfBuf], 'sample.pdf', { type: 'application/pdf' });
-  win2.CyzieApp.ingestFile(pdfFile);
+  await win2.CyzieApp.ingestFile(pdfFile);
+  await until(() => win2.CyzieApp.state.busy === false, { timeout: 30000 });
   const pdfLesson = await until(() => {
     const l = win2.CyzieApp.state.lesson;
     return l?.fileName === 'sample.pdf' ? l : null;
@@ -348,6 +358,53 @@ async function run() {
   const pdfQuestion = await until(() => win2.CyzieApp.state.lesson?.session?.current, { timeout: 15000 });
   check('.pdf lesson asks a question', !!pdfQuestion, JSON.stringify(win2.CyzieApp.state.lesson?.session?.current?.type));
   check('.pdf lesson is listed in the sidebar', [...doc3.querySelectorAll('#lessonList .li-name')].some(n => /sample\b/i.test(n.textContent) || /sample/.test(n.textContent)), doc3.querySelector('#lessonList')?.textContent.slice(0, 120));
+
+  /* ------------------------------------------ 9d. welcome + design --- */
+  await loadFrame('../index.html?instant=1&fresh=1');
+  await boot();
+  const w4 = frame.contentWindow;
+  const d4 = w4.document;
+  await until(() => d4.querySelector('#emptyState') || d4.querySelector('.msg'), { timeout: 15000 });
+  const welcomeVisible = await until(() => d4.querySelector('#emptyState')?.offsetParent !== null, { timeout: 8000 });
+  if (welcomeVisible) {
+    const greeted = await until(() => /Good (morning|afternoon|evening)|Still up/i.test(text(d4.querySelector('#welcomeGreeting'))), { timeout: 6000 });
+    check('welcome screen shows a time-based greeting', greeted, text(d4.querySelector('#welcomeGreeting')));
+    check('welcome screen shows the animated mark', !!d4.querySelector('.welcome-mark .core') && !!d4.querySelector('.welcome-mark .halo'));
+    check('welcome mark animation is live', getComputedStyle(d4.querySelector('.welcome-mark .halo')).animationName !== 'none', getComputedStyle(d4.querySelector('.welcome-mark .halo')).animationName);
+    check('welcome explains the three steps', d4.querySelectorAll('.welcome-steps li').length === 3, `${d4.querySelectorAll('.welcome-steps li').length}`);
+    check('welcome offers suggestion chips', d4.querySelectorAll('#suggestions button').length >= 3, `${d4.querySelectorAll('#suggestions button').length}`);
+    check('welcome states the privacy promise', /never uploaded|no server/i.test(text(d4.querySelector('.welcome-foot'))));
+    check('welcome drop zone lists formats', /pptx/i.test(text(d4.querySelector('#dropzone'))));
+    d4.querySelector('#suggestions button').click();
+    const noticed = await until(() => d4.querySelector('.notice'), { timeout: 6000 });
+    check('a suggestion chip without a lesson explains what to do', !!noticed && /Choose a file|upload/i.test(text(d4.querySelector('.notice') || d4.querySelector('#emptyState'))), text(d4.querySelector('.notice')).slice(0, 80));
+  } else {
+    check('welcome screen visible', !!welcomeVisible, 'the app opened straight into a lesson');
+  }
+  check('a content-security-policy is enforced', /script-src 'self'/.test(d4.querySelector('meta[http-equiv="Content-Security-Policy"]')?.getAttribute('content') || ''));
+  check('no external resources are loaded', w4.performance.getEntriesByType('resource').every(r => r.name.startsWith(w4.location.origin) || r.name.startsWith('data:') || r.name.startsWith('blob:')),
+    w4.performance.getEntriesByType('resource').filter(r => !r.name.startsWith(w4.location.origin)).map(r => r.name).slice(0, 3).join(' | '));
+
+  /* ------------------------------------------------ 9e. coding slides --- */
+  const codeMd = await (await fetch('../tests/fixtures/code-java.md')).text();
+  await w4.CyzieApp.ingestFile(new w4.File([codeMd], 'code-java.md', { type: 'text/markdown' }));
+  const codeLesson = await until(() => (w4.CyzieApp.state.lesson?.fileName === 'code-java.md' ? w4.CyzieApp.state.lesson : null), { timeout: 20000 });
+  check('a coding deck builds a lesson', !!codeLesson, w4.CyzieApp.state.lesson?.name);
+  check('coding deck reports its language', (codeLesson?.deck?.stats.languages || []).includes('java'), JSON.stringify(codeLesson?.deck?.stats.languages));
+  check('coding deck finds code slides', (codeLesson?.deck?.stats.codeSlides || 0) >= 2, `${codeLesson?.deck?.stats.codeSlides}`);
+  await until(() => w4.CyzieApp.state.busy === false, { timeout: 20000 });
+  await until(() => d4.querySelector('.code-block'), { timeout: 15000 });
+  const codeBlock = d4.querySelector('.code-block');
+  check('the code is rendered in a chat code block', !!codeBlock);
+  check('the code is syntax highlighted', !!codeBlock?.querySelector('.tok-kw'), codeBlock ? [...codeBlock.querySelectorAll('span')].slice(0, 3).map(s => s.className).join(',') : 'none');
+  check('code blocks offer a copy button', !!codeBlock?.querySelector('.code-copy'));
+  check('the code text is escaped, not markup', !/<span class="tok/.test(codeBlock?.innerText || '') , (codeBlock?.innerText || '').slice(0, 60));
+  const slideCard = d4.querySelector('.slide-card-chat');
+  check('the slide itself is shown in the chat', !!slideCard);
+  check('the slide card names the slide', /Slide \d+ of \d+/.test(text(slideCard?.querySelector('.marker'))), text(slideCard?.querySelector('.marker')));
+  check('the slide card lists the slide text', slideCard.querySelectorAll('.slide-body .line, .slide-body .code-block').length > 0, `${slideCard.querySelectorAll('.slide-body .line').length} lines`);
+  const moving = await until(() => getComputedStyle(d4.querySelector('.msg')).animationName !== 'none', { timeout: 5000 });
+  check('messages animate in', moving, getComputedStyle(d4.querySelector('.msg')).animationName);
 
   /* -------------------------------------------------- 10. streaming mode --- */
   await loadFrame('../index.html?stream=1');
@@ -415,6 +472,14 @@ function finish() {
   document.title = failed.length ? `FAIL ${failed.length}/${results.length}` : `PASS ${results.length}/${results.length}`;
   window.__cyzieSelfTest = { total: results.length, failed: failed.map(f => f.name), detail: results };
   console.log(JSON.stringify(window.__cyzieSelfTest));
+  postReport('selftest', { total: results.length, passed: results.length - failed.length, failed: failed.map(f => `${f.name} :: ${f.detail || ''}`), checks: results });
+}
+
+/** Send the result to the dev harness server so it survives a dead page (silently ignored otherwise). */
+function postReport(name, payload) {
+  try {
+    fetch(`/report?name=${name}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) }).catch(() => {});
+  } catch { /* served without the report endpoint */ }
 }
 
 run().then(() => {},

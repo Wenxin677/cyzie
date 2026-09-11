@@ -4,13 +4,19 @@
 import { openZip } from './zip.js';
 import { normalize } from './nlp.js';
 
+import { LIMITS } from './limits.js';
+
 const ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
+
+export { LIMITS };
 
 export function decodeXmlEntities(s = '') {
   return String(s).replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (m, g) => {
     if (g[0] === '#') {
       const code = g[1] === 'x' || g[1] === 'X' ? parseInt(g.slice(2), 16) : parseInt(g.slice(1), 10);
-      return Number.isFinite(code) ? String.fromCodePoint(code) : m;
+      // Only accept real, printable code points; anything else is dropped rather than thrown.
+      if (!Number.isFinite(code) || code < 0 || code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF)) return '';
+      try { return String.fromCodePoint(code); } catch { return ''; }
     }
     return Object.prototype.hasOwnProperty.call(ENTITIES, g) ? ENTITIES[g] : m;
   });
@@ -18,18 +24,22 @@ export function decodeXmlEntities(s = '') {
 
 /** Tokenize XML into {kind:'open'|'close'|'self'|'text', name, attrs, text} events. */
 export function* xmlTokens(xml) {
+  const source = typeof xml === 'string' ? xml : String(xml);
+  if (source.length > LIMITS.maxXmlChars) {
+    throw new Error('This part of the file is too large to read safely.');
+  }
   let i = 0;
-  const n = xml.length;
+  const n = source.length;
   while (i < n) {
-    const lt = xml.indexOf('<', i);
+    const lt = source.indexOf('<', i);
     if (lt === -1) {
-      if (i < n) yield { kind: 'text', text: xml.slice(i) };
+      if (i < n) yield { kind: 'text', text: source.slice(i) };
       return;
     }
-    if (lt > i) yield { kind: 'text', text: xml.slice(i, lt) };
-    const gt = xml.indexOf('>', lt);
+    if (lt > i) yield { kind: 'text', text: source.slice(i, lt) };
+    const gt = source.indexOf('>', lt);
     if (gt === -1) return;
-    let inner = xml.slice(lt + 1, gt);
+    let inner = source.slice(lt + 1, gt);
     i = gt + 1;
     if (!inner || inner[0] === '!' || inner[0] === '?') continue;
     const selfClosing = inner.endsWith('/');

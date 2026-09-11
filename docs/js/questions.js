@@ -2,6 +2,7 @@
    Everything is derived from the uploaded file; Cyzie never invents facts. */
 
 import { keyStems, contentWords, words, similarity, normalize, truncate, shuffle, uniqueBy, coverAnswer, stem, pick } from './nlp.js';
+import { highlightCode, walkthrough, readLine, statedOutput } from './code.js';
 
 const ANTONYMS = [
   ['increase', 'decrease'], ['increases', 'decreases'], ['increase', 'reduce'], ['higher', 'lower'],
@@ -297,6 +298,347 @@ function buildGist(slide) {
   };
 }
 
+/* ------------------------------------------------------- code questions --- */
+
+const CODE_HELPERS = {
+  python: { comment: '#', keywordHint: 'a colon at the end of the line' },
+  java: { comment: '//', keywordHint: 'a semicolon at the end of the line' },
+  javascript: { comment: '//', keywordHint: 'a matching pair of braces' },
+  c: { comment: '//', keywordHint: 'a semicolon at the end of the line' },
+  cpp: { comment: '//', keywordHint: 'a semicolon at the end of the line' },
+  csharp: { comment: '//', keywordHint: 'a semicolon at the end of the line' },
+};
+
+function codeFence(code, lang = 'unknown') {
+  return '```' + lang + '\n' + code + '\n```';
+}
+
+/** "How many times does this run?" — the honest way to use a long repeated output. */
+function buildCodeCount(slide, sim, rng) {
+  const outputs = sim.outputs;
+  const uniq = uniqueBy(outputs, o => o);
+  if (uniq.length !== 1) return null;
+  const count = outputs.length;
+  const wrongs = uniqueBy([count + 1, count - 1, count * 2, Math.round(count / 2), count + 10], n => n)
+    .filter(n => n > 0 && n !== count).slice(0, 3);
+  if (wrongs.length < 2) return null;
+  return {
+    type: 'code_count',
+    focus: 'loop count',
+    prompt: `The code on slide ${slide.index} prints **${truncate(uniq[0], 40)}** over and over.\n\nHow many times does it print it?`,
+    answer: { text: String(count), keywords: [String(count)], numeric: count },
+    sourceLine: sim.code,
+    explanation: `The loop runs ${count} times, so that line is printed ${count} times.`,
+    difficulty: 2,
+    choices: shuffle([
+      { text: String(count), correct: true },
+      ...wrongs.map(n => ({ text: String(n), correct: false })),
+    ], rng()),
+  };
+}
+
+function buildCodeOutput(deck, slide, rng) {
+  const code = slide.code;
+  if (!code || !code.blocks.length) return null;
+  const block = code.blocks[0];
+  const sim = code.output;
+
+  if (sim) {
+    const countQ = buildCodeCount(slide, sim, rng);
+    if (countQ) return countQ;
+    const correct = sim.summary;
+    const wrongs = [];
+    // Distractors: the same code with a shifted bound or start.
+    for (const shift of [1, -1, 2]) {
+      const m = sim.code.match(/(\d+)(?![\s\S]*\d)/);
+      if (!m) break;
+      const n = parseInt(m[1], 10) + shift;
+      if (n < 0) continue;
+      const mutated = sim.outputs.map((_, i) => (i < sim.outputs.length + shift ? sim.outputs[i] : ''));
+      const seq = sim.outputs.slice(0, Math.max(0, sim.outputs.length + shift));
+      if (seq.length && seq.length !== sim.outputs.length) wrongs.push(seq.join(' '));
+    }
+    if (sim.outputs.length > 1) {
+      wrongs.push(sim.outputs.slice(1).concat(sim.outputs[0]).join(' '));
+      wrongs.push(sim.outputs.slice(0, -1).join(' '));
+    }
+    const options = uniqueBy(wrongs.filter(w => w && w !== correct), w => w).slice(0, 3);
+    const q = {
+      type: 'code_output',
+      focus: 'program output',
+      prompt: `Look at the ${block.langLabel} code on slide ${slide.index}.\n\n${codeFence(block.code, block.lang)}\n\n**What does it print, in order?**`,
+      answer: { text: correct, keywords: contentWords(correct), sequence: sim.outputs },
+      sourceLine: block.code,
+      explanation: `Running it gives: ${correct}\n\nThat is worked out step by step from the loop in the code — nothing here was guessed from outside the slide.`,
+      difficulty: 3,
+    };
+    if (options.length >= 3 && sim.outputs.length <= 8) {
+      q.choices = shuffle([{ text: correct, correct: true }, ...options.slice(0, 3).map(o => ({ text: o, correct: false }))], rng());
+      q.prompt = `Look at the ${block.langLabel} code on slide ${slide.index}.\n\n${codeFence(block.code, block.lang)}\n\n**What does it print?**`;
+      q.difficulty = 2;
+    }
+    return q;
+  }
+
+  const stated = code.stated[0];
+  if (stated) {
+    const text = stated.text.replace(/^["']|["']$/g, '');
+    return {
+      type: 'code_output',
+      focus: 'program output',
+      prompt: `Look at the ${block.langLabel} code on slide ${slide.index}.\n\n${codeFence(block.code, block.lang)}\n\n**What does this program output?**`,
+      answer: { text, keywords: contentWords(text) },
+      sourceLine: stated.from,
+      explanation: `The slide gives the answer itself: **${truncate(text, 120)}**`,
+      difficulty: 2,
+    };
+  }
+  return null;
+}
+
+/** A line that only explains the code (a comment) is a poor quiz target. */
+function isCommentLine(line = '', meaning = '') {
+  return /^\s*(\/\/|#|--|\*|\/\*)/.test(line) || /^a comment/i.test(meaning);
+}
+
+function buildLineMeaning(deck, slide, rng) {
+  const code = slide.code;
+  if (!code || code.walk.length < 2) return null;
+  const pool = [];
+  const usable = row => row.meaning && row.meaning.length > 12 && !isCommentLine(row.line, row.meaning);
+  for (const row of code.walk) if (usable(row)) pool.push({ ...row, slide: slide.index });
+  for (const other of deck.slides) {
+    if (other.index === slide.index || !other.code) continue;
+    for (const row of other.code.walk || []) if (usable(row)) pool.push({ ...row, slide: other.index });
+  }
+  const own = pool.filter(p => p.slide === slide.index);
+  if (!own.length) return null;
+  const target = pick(own, rng());
+  // Distractors must read differently from the answer AND from each other.
+  const wrongs = [];
+  for (const cand of shuffle(pool, rng())) {
+    if (wrongs.length >= 3) break;
+    if (cand.line === target.line) continue;
+    if (cand.meaning.toLowerCase() === target.meaning.toLowerCase()) continue;
+    if (wrongs.some(w => similarity(w.meaning, cand.meaning) > 0.7)) continue;
+    wrongs.push(cand);
+  }
+  if (wrongs.length < 3) return null;
+  return {
+    type: 'line_meaning',
+    focus: target.line,
+    prompt: `On slide ${slide.index} there is this line of ${code.lang.label}:\n\n${codeFence(target.line, code.lang.id)}\n\n**What does that line do?**`,
+    choices: shuffle([
+      { text: target.meaning, correct: true },
+      ...wrongs.map(w => ({ text: w.meaning, correct: false })),
+    ], rng()),
+    answer: { text: target.meaning, keywords: contentWords(target.meaning) },
+    sourceLine: target.line,
+    explanation: `Line ${target.n}: \`${truncate(target.line, 90)}\` — ${target.meaning}.`,
+    difficulty: 2,
+  };
+}
+
+function buildCodeKeyword(deck, slide, rng) {
+  const code = slide.code;
+  if (!code || !code.blocks.length) return null;
+  const block = code.blocks[0];
+  const keywordPool = ['def', 'while', 'for', 'if', 'else', 'elif', 'return', 'import', 'class', 'new', 'public', 'static', 'void', 'int', 'range', 'print'];
+  const found = [];
+  block.lines.forEach((line, i) => {
+    for (const kw of keywordPool) {
+      const re = new RegExp(`(^|[^\\w.])${kw}([^\\w]|$)`);
+      if (re.test(line)) found.push({ kw, i, line });
+    }
+  });
+  if (!found.length) return null;
+  const target = pick(found, rng());
+  const blanked = target.line.replace(new RegExp(`(^|[^\\w.])${target.kw}([^\\w]|$)`), (m, a, b) => `${a}_____${b}`);
+  if (blanked === target.line) return null;
+  const others = uniqueBy(keywordPool.filter(k => k !== target.kw), k => k).slice(0, 12);
+  const wrongs = shuffle(others, rng() + 0.2).slice(0, 3);
+  const numbered = block.lines.map((l, i) => `${i + 1}. ${i === target.i ? blanked : l}`).join('\n');
+  return {
+    type: 'code_keyword',
+    focus: target.kw,
+    prompt: `Line ${target.i + 1} of the ${block.langLabel} code on slide ${slide.index} has a keyword missing. Fill the blank:\n\n${codeFence(numbered, block.lang)}`,
+    answer: { text: target.kw, keywords: [target.kw] },
+    sourceLine: target.line,
+    explanation: `The real line is \`${truncate(target.line, 110)}\` — the missing word is **${target.kw}**.`,
+    difficulty: 1,
+    choices: shuffle([{ text: target.kw, correct: true }, ...wrongs.map(w => ({ text: w, correct: false }))], rng()),
+  };
+}
+
+function buildCodeBlank(deck, slide, rng) {
+  const code = slide.code;
+  if (!code || !code.blocks.length) return null;
+  const block = code.blocks[0];
+  if (block.lines.length < 3) return null;
+  // Prefer a line that carries the logic: loop header, condition, return, or the first statement.
+  const scored = block.lines.map((line, i) => {
+    let score = 0;
+    if (/\b(for|while|if|elif|else)\b/.test(line)) score += 3;
+    if (/\b(return|print|println|cout)\b/.test(line)) score += 2;
+    if (/\b(def|function|class|public|static)\b/.test(line)) score += 2;
+    if (i === 0) score += 1;
+    return { line, i, score };
+  }).sort((a, b) => b.score - a.score);
+  const target = scored[0];
+  const distractors = [];
+  for (const other of block.lines) if (other !== target.line) distractors.push(other);
+  for (const other of deck.slides) {
+    if (other.index === slide.index || !other.code) continue;
+    for (const b of other.code.blocks) for (const l of b.lines) distractors.push(l);
+  }
+  const chosen = shuffle(uniqueBy(distractors, d => d), rng()).slice(0, 3);
+  if (chosen.length < 2) return null;
+  const shown = block.lines.filter((_, i) => i !== target.i).map((l, i) => `${i + 1}. ${l}`).join('\n');
+  return {
+    type: 'code_blank',
+    focus: `line ${target.i + 1}`,
+    prompt: `One line is missing from this ${block.langLabel} code (slide ${slide.index}). Which line belongs in the gap?`,
+    codeContext: codeFence(shown, block.lang),
+    choices: shuffle([
+      { text: target.line, correct: true },
+      ...chosen.map(c => ({ text: c, correct: false })),
+    ], rng()),
+    answer: { text: target.line, keywords: contentWords(target.line) },
+    sourceLine: target.line,
+    explanation: `The full block is:\n\n${codeFence(block.code, block.lang)}\n\nThe missing line is \`${truncate(target.line, 110)}\`.`,
+    difficulty: 3,
+  };
+}
+
+function introduceBug(line, langId) {
+  const t = line;
+  if (langId === 'python') {
+    if (/:\s*$/.test(t)) return { code: t.replace(/:\s*$/, ''), problem: 'the colon is missing at the end of the line', keyword: 'colon' };
+    if (/==/.test(t)) return { code: t.replace('==', '='), problem: 'it uses = (assignment) where a comparison (==) belongs', keyword: 'equals' };
+    if (/^(\s+)/.test(t)) return { code: t.replace(/^\s+/, ''), problem: 'the line is not indented, so it falls outside the block', keyword: 'indent' };
+    if (/\b(range|print|input|len)\b/.test(t)) return { code: t.replace(/\b(range|print|input|len)\b/, m => m.slice(0, -1) + 'e'), problem: `the function name ${t.match(/\b(range|print|input|len)\b/)[1]}() is misspelled`, keyword: t.match(/\b(range|print|input|len)\b/)[1] };
+    return null;
+  }
+  if (/;\s*$/.test(t)) return { code: t.replace(/;\s*$/, ''), problem: 'the semicolon at the end of the line is missing', keyword: 'semicolon' };
+  if (/==/.test(t)) return { code: t.replace('==', '='), problem: 'it uses = (assignment) where a comparison (==) belongs', keyword: 'equals' };
+  if (/\bi\s*<=\s*\d+/.test(t)) return { code: t.replace(/<=/, '<'), problem: 'the loop bound is off by one (<= should be <, or the bound should change)', keyword: 'bound' };
+  if (/\{[^}]*$/.test(t)) return { code: t.replace(/\{$/, ''), problem: 'the opening brace at the end of the line is missing', keyword: 'brace' };
+  if (/\b(println|printf|cout|print)\b/.test(t)) return { code: t.replace(/\b(println|printf|cout|print)\b/, m => m.slice(0, -1) + 'e'), problem: `the method name ${t.match(/\b(println|printf|cout|print)\b/)[1]}() is misspelled`, keyword: t.match(/\b(println|printf|cout|print)\b/)[1] };
+  return null;
+}
+
+function buildCodeError(deck, slide, rng) {
+  const code = slide.code;
+  if (!code || !code.blocks.length) return null;
+  const block = code.blocks[0];
+  const candidates = [];
+  block.lines.forEach((line, i) => {
+    if (line.trim().length < 6) return;
+    const bug = introduceBug(line, block.lang);
+    if (bug) candidates.push({ line, i, bug });
+  });
+  if (!candidates.length) return null;
+  const chosen = pick(candidates, rng());
+  const broken = block.lines.map((l, i) => (i === chosen.i ? chosen.bug.code : l)).join('\n');
+  const meaning = readLine(chosen.line, block.lang) || 'this line does something important';
+  return {
+    type: 'code_error',
+    focus: 'spot the bug',
+    prompt: `This ${block.langLabel} code (slide ${slide.index}) has been changed so that it will no longer work as intended.\n\n${codeFence(broken, block.lang)}\n\n**What is wrong with it?**`,
+    answer: {
+      text: `Line ${chosen.i + 1}: ${chosen.bug.problem}.`,
+      keywords: [chosen.bug.keyword, 'line', ...contentWords(chosen.bug.problem)].map(stem),
+      also: [String(chosen.i + 1)],
+    },
+    sourceLine: chosen.line,
+    explanation: `Line ${chosen.i + 1} should read \`${truncate(chosen.line, 110)}\` — ${chosen.bug.problem}.\n\nThat line ${meaning}.`,
+    difficulty: 4,
+  };
+}
+
+function buildCodeRecall(deck, slide, rng) {
+  const code = slide.code;
+  if (!code || !code.blocks.length) return null;
+  const block = code.blocks[0];
+  const rows = block.lines
+    .map((line, i) => ({ line, i, meaning: readLine(line, block.lang) }))
+    .filter(r => r.meaning && !isCommentLine(r.line, r.meaning) && r.line.trim().length > 8 && /[(){};:=]/.test(r.line));
+  if (!rows.length) return null;
+  const target = pick(rows, rng());
+  const firstToken = target.line.trim().split(/[\s(]/)[0];
+  return {
+    type: 'code_recall',
+    focus: target.line,
+    prompt: `From memory, write the line of ${block.langLabel} on slide ${slide.index} that ${target.meaning.replace(/^the /, '')}.\n\nType the line exactly — punctuation matters.`,
+    answer: {
+      text: target.line.trim(),
+      keywords: contentWords(target.line),
+      codeLine: target.line.trim(),
+      firstToken,
+    },
+    sourceLine: target.line,
+    explanation: `The line is \`${truncate(target.line, 110)}\`${target.line.trim().startsWith(firstToken) ? `  (it starts with \`${firstToken}\`)` : ''}.`,
+    hint: `Start with \`${firstToken}\`.`,
+    difficulty: 4,
+  };
+}
+
+/** All code questions for one slide. */
+function codeQuestionSet(deck, slide, rng) {
+  if (!slide.code || !slide.code.blocks.length) return [];
+  const builders = [buildCodeKeyword, buildLineMeaning, buildCodeOutput, buildCodeBlank, buildCodeError, buildCodeRecall];
+  const out = [];
+  for (const build of builders) {
+    try {
+      const q = build(deck, slide, rng);
+      if (q && q.answer && q.answer.text) out.push(q);
+    } catch { /* a builder that cannot handle this code simply contributes nothing */ }
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------- summary --- */
+
+/** Token-shape similarity: code lines that differ only in a name or number still count as near-twins. */
+export function shapeSimilarity(a = '', b = '') {
+  const shape = s => normalize(s)
+    .replace(/\b\d+(\.\d+)?\b/g, '#')
+    .replace(/"[^"]*"|'[^']*'/g, '"s"')
+    .toLowerCase()
+    .replace(/[^a-z0-9#."\s]/g, ' ')
+    .split(/\s+/).filter(Boolean);
+  const A = new Set(shape(a)); const B = new Set(shape(b));
+  if (!A.size || !B.size) return 0;
+  let inter = 0;
+  for (const t of A) if (B.has(t)) inter++;
+  return inter / (A.size + B.size - inter);
+}
+
+/** A multiple-choice question is only usable when the options are distinct and exactly one is right. */
+export function validChoices(question) {
+  if (!question.choices || !question.choices.length) return true;
+  if (question.choices.length < 3) return false;
+  if (question.choices.filter(c => c.correct).length !== 1) return false;
+  const seen = new Set();
+  for (const c of question.choices) {
+    const key = normalize(c.text).toLowerCase();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+  }
+  const correct = question.choices.find(c => c.correct);
+  for (let i = 0; i < question.choices.length; i++) {
+    for (let j = i + 1; j < question.choices.length; j++) {
+      const a = question.choices[i].text;
+      const b = question.choices[j].text;
+      if (similarity(a, b) > 0.9) return false;
+      // Two options that read the same apart from a name or number are a trick, not a question.
+      const near = shapeSimilarity(a, b) > 0.8 || shapeSimilarity(a, correct.text) > 0.8;
+      if (near && Math.abs(a.length - b.length) < 12) return false;
+    }
+  }
+  return true;
+}
+
 /**
  * Generate the question set for one slide.
  * @param {object} deck  result of analyzeDeck()
@@ -308,6 +650,9 @@ export function buildQuestions(deck, slide, { count = 5, seed = '' } = {}) {
   const rng = seededRng(`${seed}|slide${slide.index}|${slide.title}`);
   const defTerms = slide.terms.filter(t => t.definition && words(cleanDefinition(t.definition)).length >= 3);
   const cands = [];
+
+  // Code slides lead with code questions — that is what the student came for.
+  cands.push(...codeQuestionSet(deck, slide, rng));
 
   for (const t of defTerms) {
     const q = buildCloze(deck, slide, t, rng, { typed: false });
@@ -338,9 +683,14 @@ export function buildQuestions(deck, slide, { count = 5, seed = '' } = {}) {
   if (gist) cands.push(gist);
 
   // Warm-up first (recognition), recall next, explanation last.
-  const order = { cloze_mcq: 1, true_false: 2, mcq_definition: 3, not_on_slide: 4, cloze_type: 5, list_recall: 6, define_short: 7, gist_short: 8 };
+  const order = {
+    code_keyword: 1, cloze_mcq: 1, line_meaning: 2, code_count: 3, code_output: 3, true_false: 3,
+    mcq_definition: 4, not_on_slide: 4, code_blank: 5, cloze_type: 5, code_error: 6,
+    list_recall: 6, code_recall: 7, define_short: 7, gist_short: 8,
+  };
   const ranked = cands
     .filter(q => q.answer.text)
+    .filter(q => validChoices(q))
     .filter((q, i, arr) => arr.findIndex(x => x.type === q.type && x.focus === q.focus) === i)
     .sort((a, b) => (order[a.type] || 9) - (order[b.type] || 9) + (a.difficulty - b.difficulty) * 0.1);
 

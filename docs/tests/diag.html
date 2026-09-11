@@ -86,22 +86,101 @@ try {
     log(false, 'app body text', (w.document.body.innerText || '').slice(0, 500).replace(/\n+/g, ' | '));
   } else {
     log(true, 'app state', `lessons=${w.CyzieApp.state.lessons.length} lesson=${w.CyzieApp.state.lesson?.name || 'none'}`);
-    const f2 = document.createElement('iframe');
-    f2.style.cssText = 'width:1100px;height:520px;border:1px solid #999;margin-top:10px';
-    f2.src = `../index.html?stream=1&diag2=${Date.now()}`;
-    document.body.appendChild(f2);
-    await new Promise(r => setTimeout(r, 3000));
-    const w2 = f2.contentWindow;
-    log(!!w2.CyzieApp?.state, 'app also boots with the streaming flag');
-    w2.CyzieApp?.loadSample();
-    await new Promise(r => setTimeout(r, 3500));
-    log(w2.document.querySelectorAll('.msg').length > 2, 'sample lesson renders in the browser', `${w2.document.querySelectorAll('.msg').length} messages`);
   }
 } catch (err) {
   log(false, 'iframe app boot', `${err.name}: ${err.message}`);
 }
 
-document.title = lines.some(l => l.startsWith('FAIL')) ? 'DIAG FAIL' : 'DIAG OK';
+// Storage-blocked mode (private windows).
+try {
+  const noStore = document.createElement('iframe');
+  noStore.style.cssText = 'width:1100px;height:420px;border:1px solid #999;margin-top:10px';
+  noStore.src = `../index.html?instant=1&nostore=1&diag=${Date.now()}`;
+  document.body.appendChild(noStore);
+  await new Promise(r => setTimeout(r, 5000));
+  const w = noStore.contentWindow;
+  log(!!w.CyzieApp?.state, 'app boots with storage blocked');
+  if (w.CyzieApp?.state) {
+    w.CyzieApp.loadSample();
+    await new Promise(r => setTimeout(r, 4000));
+    log(w.document.querySelectorAll('.msg').length > 2, 'lesson runs with storage blocked', `${w.document.querySelectorAll('.msg').length} messages`);
+  } else {
+    log(false, 'nostore body text', (w.document.body.innerText || '').slice(0, 400).replace(/\n+/g, ' | '));
+  }
+} catch (err) {
+  log(false, 'nostore iframe', `${err.name}: ${err.message}`);
+}
+
+// Warm-template boot also needs to work.
+try {
+  const fresh = document.createElement('iframe');
+  fresh.style.cssText = 'width:1100px;height:520px;border:1px solid #999;margin-top:10px';
+  fresh.src = `../index.html?instant=1&fresh=1&diag=${Date.now()}`;
+  document.body.appendChild(fresh);
+  await new Promise(r => setTimeout(r, 4000));
+  const w = fresh.contentWindow;
+  log(!!w.CyzieApp?.state, 'app boots on the home screen (?fresh=1)');
+  log(/Good |Still up/.test(w.document.querySelector('#welcomeGreeting')?.textContent || ''), 'home greeting is set', w.document.querySelector('#welcomeGreeting')?.textContent);
+} catch (err) {
+  log(false, 'fresh iframe', `${err.name}: ${err.message}`);
+}
+
+// Upload probe: does the .pptx fixture ingest end-to-end in the browser?
+try {
+  const probe = document.createElement('iframe');
+  probe.style.cssText = 'width:1100px;height:400px;border:1px solid #999;margin-top:10px';
+  probe.src = `../index.html?instant=1&fresh=1&diag=${Date.now()}`;
+  document.body.appendChild(probe);
+  await new Promise(r => setTimeout(r, 3000));
+  const w = probe.contentWindow;
+  const buf = await (await fetch('../tests/fixtures/sample.pptx')).arrayBuffer();
+  const file = new w.File([buf], 'sample.pptx', { type: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' });
+  log(file.size > 1000, 'probe: fixture file built', `${file.size} bytes`);
+  w.CyzieApp.ingestFile(file);
+  await new Promise(r => setTimeout(r, 5000));
+  const lesson = w.CyzieApp.state.lesson;
+  log(lesson?.fileName === 'sample.pptx', 'probe: .pptx ingested', lesson ? `${lesson.fileName} · ${lesson.deck?.slides.length} slides` : 'no lesson');
+  const notices = [...w.document.querySelectorAll('.notice')].map(n => n.textContent.trim());
+  log(notices.length === 0, 'probe: no error notice', notices.join(' | ').slice(0, 300));
+  log(w.document.querySelectorAll('.msg').length > 2, 'probe: chat rendered', `${w.document.querySelectorAll('.msg').length} messages`);
+  log(!!w.document.querySelector('.code-block, .slide-card-chat'), 'probe: slide card rendered');
+} catch (err) {
+  log(false, 'upload probe', `${err.name}: ${err.message}`);
+}
+
+// Demo probe: ?demo=1 must leave the header and the context panel describing the open lesson.
+try {
+  const demo = document.createElement('iframe');
+  demo.style.cssText = 'width:1100px;height:400px;border:1px solid #999;margin-top:10px';
+  demo.src = `../index.html?demo=1&diag=${Date.now()}`;
+  document.body.appendChild(demo);
+  await new Promise(r => setTimeout(r, 6000));
+  const dw = demo.contentWindow;
+  const dd = dw.document;
+  const header = dd.querySelector('#lessonTitle')?.textContent?.trim() || '';
+  const sub = dd.querySelector('#slideIndicator')?.textContent?.trim() || '';
+  const panelEmptyVisible = !dd.querySelector('#panelEmpty')?.hidden;
+  const panelBodyVisible = !dd.querySelector('#panelBody')?.hidden;
+  const slideTitle = dd.querySelector('#slideCardTitle')?.textContent?.trim() || '';
+  log(header && header !== 'No lesson loaded', 'demo: header names the open lesson', header);
+  log(!!sub, 'demo: header shows slide position', sub);
+  log(!panelEmptyVisible && panelBodyVisible, 'demo: context panel shows the lesson', `empty=${panelEmptyVisible} body=${panelBodyVisible}`);
+  log(!!slideTitle && slideTitle !== '—', 'demo: context panel has the slide', slideTitle);
+  log(dd.querySelectorAll('.msg').length > 2, 'demo: lesson messages rendered', `${dd.querySelectorAll('.msg').length} messages`);
+} catch (err) {
+  log(false, 'demo probe', `${err.name}: ${err.message}`);
+}
+
+const failures = lines.filter(l => l.startsWith('FAIL'));
+document.title = failures.length ? 'DIAG FAIL' : 'DIAG OK';
+// Report to disk too, so the headless runner can collect this page like the other harnesses.
+try {
+  await fetch('/report/diag', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ total: lines.length, passed: lines.length - failures.length, failed: failures, checks: lines }),
+  });
+} catch { /* reporting is best effort */ }
 </script>
 </body>
 </html>

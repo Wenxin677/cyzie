@@ -94,6 +94,22 @@ export function search(index, query, { limit = 6, perSlide = 2 } = {}) {
 
 export const LOW_CONFIDENCE = 1.6;
 
+/* Words that describe the deck rather than its content ("this deck", "the next slide").
+   On their own they must never be treated as a real match — a question like "what is the
+   capital of a country not in this deck?" shares only "deck" with the slides. */
+const META_PREFIXES = ['deck', 'slide', 'lesson', 'present', 'notebook', 'file', 'page', 'class',
+  'course', 'chapter', 'lectur', 'unit', 'content', 'materi', 'topic', 'exampl', 'question',
+  'part', 'summar', 'overal', 'thing', 'stuff', 'exam', 'test', 'stud', 'learn', 'teach', 'cover'];
+const isMeta = s => META_PREFIXES.some(p => s.startsWith(p));
+
+/** How much of the question's real subject matter the deck actually contains (0–1). */
+export function queryCoverage(index, query) {
+  const terms = [...new Set(keyStems(query))].filter(s => s.length > 3 && !isMeta(s));
+  if (!terms.length) return { terms, matched: [], coverage: 0 };
+  const matched = terms.filter(s => index.idf.has(s));
+  return { terms, matched, coverage: matched.length / terms.length };
+}
+
 /**
  * Answer a free-form question from the deck.
  * @returns {{kind:'term'|'passage'|'none', hits:Array, confidence:number, closest:Array}}
@@ -108,8 +124,13 @@ export function answerQuestion(deck, index, query, { lookupTerm } = {}) {
       return { kind: 'term', term, hits, confidence: Math.max(best, 3) };
     }
   }
-  if (best >= LOW_CONFIDENCE) return { kind: 'passage', hits, confidence: best, closest };
-  return { kind: 'none', hits: hits.filter(h => h.score > best * 0.4), confidence: best, closest };
+  // A confident score is not enough on its own: the question must overlap the deck's actual
+  // subject matter, or we admit we do not have it instead of answering from a stray word.
+  const { terms, matched, coverage } = queryCoverage(index, query);
+  if (best >= LOW_CONFIDENCE && (coverage >= 0.34 || matched.length >= 2)) {
+    return { kind: 'passage', hits, confidence: best, closest, coverage };
+  }
+  return { kind: 'none', hits: hits.filter(h => h.score > best * 0.4), confidence: best, closest, coverage };
 }
 
 /** Slides whose content is closest to an arbitrary string (used for "where is X mentioned"). */
