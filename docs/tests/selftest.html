@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Cyzie browser self-test — running…</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 13px/1.5 "Segoe UI", system-ui, sans-serif; margin: 0; padding: 16px 18px 40px; }
+  h1 { font-size: 17px; margin: 0 0 4px; }
+  #summary { font-weight: 600; margin-bottom: 10px; }
+  ol { list-style: none; margin: 0; padding: 0; }
+  li { padding: 2px 0; border-bottom: 1px solid rgba(128,128,128,.18); display: flex; gap: 8px; }
+  .ok { color: #14715c; }
+  .fail { color: #a13a2c; font-weight: 600; }
+  code { font-family: Consolas, monospace; background: rgba(128,128,128,.15); padding: 0 3px; border-radius: 3px; }
+  #frame { width: 1280px; height: 720px; border: 1px solid #999; margin-top: 14px; }
+  .muted { color: #777; }
+</style>
+</head>
+<body>
+<h1>Cyzie — browser self-test</h1>
+<div id="summary">Running…</div>
+<ol id="results"></ol>
+<iframe id="frame" title="Cyzie under test"></iframe>
+<script type="module">
+const out = document.getElementById('results');
+const summary = document.getElementById('summary');
+const frame = document.getElementById('frame');
+const results = [];
+
+function report(name, ok, detail = '') {
+  results.push({ name, ok, detail });
+  const li = document.createElement('li');
+  li.innerHTML = `<span class="${ok ? 'ok' : 'fail'}">${ok ? 'PASS' : 'FAIL'}</span><span>${name}${detail ? ` — <code>${String(detail).slice(0, 300)}</code>` : ''}</span>`;
+  out.appendChild(li);
+}
+function check(name, ok, detail) { report(name, !!ok, detail); return !!ok; }
+const wait = ms => new Promise(r => setTimeout(r, ms));
+async function until(fn, { timeout = 12000, interval = 60 } = {}) {
+  const start = Date.now();
+  for (;;) {
+    try { const v = await fn(); if (v) return v; } catch { /* keep polling */ }
+    if (Date.now() - start > timeout) return null;
+    await wait(interval);
+  }
+}
+const text = node => (node?.textContent || '').trim();
+
+async function clearDb() {
+  try {
+    await new Promise(resolve => {
+      const req = indexedDB.deleteDatabase('cyzie');
+      req.onsuccess = req.onerror = req.onblocked = () => resolve();
+      setTimeout(resolve, 800);
+    });
+  } catch { /* ignore */ }
+}
+
+/** Read a transcript record straight out of IndexedDB (same origin as the app). */
+function readStoredTranscript(lessonId) {
+  return new Promise(resolve => {
+    const open = indexedDB.open('cyzie');
+    open.onerror = () => resolve(null);
+    open.onsuccess = () => {
+      const db = open.result;
+      if (!db.objectStoreNames.contains('history')) { resolve(null); return; }
+      const req = db.transaction('history', 'readonly').objectStore('history').get(lessonId);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => resolve(null);
+    };
+  });
+}
+
+let consoleErrors = [];
+function hookConsole(win) {
+  const orig = win.console.error;
+  win.console.error = (...args) => { consoleErrors.push(args.map(String).join(' ')); orig?.apply(win.console, args); };
+  win.addEventListener('error', ev => consoleErrors.push(`window error: ${ev.message}`));
+  win.addEventListener('unhandledrejection', ev => consoleErrors.push(`rejection: ${ev.reason?.message || ev.reason}`));
+}
+
+function loadFrame(src) {
+  // Cache-buster on the document URL: the local dev server sends no cache headers, and a stale
+  // index.html would keep pointing at an older app.js.
+  const bust = `${src.includes('?') ? '&' : '?'}cb=${Date.now()}`;
+  return new Promise(resolve => {
+    frame.src = src + bust;
+    frame.onload = () => resolve();
+    setTimeout(resolve, 15000);   // never hang on a load that never fires
+  });
+}
+
+async function boot() {
+  const win = () => frame.contentWindow;
+  return until(() => win()?.CyzieApp?.state, { timeout: 15000 });
+}
+
+async function run() {
+  await clearDb();
+  await loadFrame('../index.html?instant=1');
+  const app = await boot();
+  if (!check('app boots and exposes state', app)) { finish(); return; }
+  hookConsole(frame.contentWindow);
+  const win = frame.contentWindow;
+  const doc = win.document;
+  const q = sel => doc.querySelector(sel);
+  const qa = sel => [...doc.querySelectorAll(sel)];
+  const messages = () => qa('.msg');
+  const cyzieMessages = () => qa('.msg.cyzie .body');
+  const bodyText = () => qa('.msg .body, .msg .bubble').map(text).join('\n');
+
+  /* ---------------------------------------------------------- 1. shell --- */
+  check('brand shows the name Cyzie', /Cyzie/.test(text(q('.brand-name'))));
+  check('composer input exists', !!q('#input') && !!q('#composer'));
+  check('empty state is visible before any lesson', !q('#emptyState').hidden && q('#emptyState').offsetParent !== null);
+  check('drop zone lists supported formats', /pptx|PowerPoint/i.test(text(q('#dropzone'))), text(q('.dz-sub')));
+
+  /* --------------------------------------------------------- 2. sample --- */
+  q('#sampleBtn').click();
+  const started = await until(() => cyzieMessages().length >= 2, { timeout: 15000 });
+  check('sample lesson starts and Cyzie speaks', started, `${cyzieMessages().length} messages`);
+  check('greeting introduces Cyzie', /Cyzie/i.test(bodyText()));
+  const taught = await until(() => /Slide \d+ —/.test(bodyText()), { timeout: 15000 });
+  check('Cyzie teaches the first slide', taught, bodyText().slice(0, 200));
+  const questionShown = await until(() => !!q('.choices, .msg .body blockquote'), { timeout: 12000 });
+  check('a question is asked on slide 1', questionShown);
+  check('quick-action chips are offered', qa('#chips .chip').length >= 2, `${qa('#chips .chip').length} chips`);
+
+  const lesson = win.CyzieApp.state.lesson;
+  check('lesson built from the sample deck', lesson && lesson.deck.slides.length >= 5, lesson?.deck.slides.length);
+  check('sample deck produced definitions', lesson.deck.stats.termsWithDefs >= 4, JSON.stringify(lesson.deck.stats));
+  check('first slide is the intro, questions start on slide 2', !lesson.deck.slides.some((s, i) => i === 0 && !s.skipQuestions) || lesson.session.slide >= 1, `slide=${lesson.session.slide}`);
+  check('header shows the lesson name', /Sample lesson/.test(text(q('#lessonTitle'))), text(q('#lessonTitle')));
+  check('header shows the slide position', /Slide \d+ of \d+/.test(text(q('#slideIndicator'))), text(q('#slideIndicator')));
+
+  /* ------------------------------------------------- 3. correct answer --- */
+  const session = lesson.session;
+  check('session is waiting for an answer', session.awaiting === 'answer', session.awaiting);
+  const currentQuestion = session.current;
+  check('current question is complete', !!(currentQuestion?.prompt && currentQuestion?.answer?.text), JSON.stringify(currentQuestion?.type));
+  check('the lesson starts on a teachable slide', !!lesson.deck.slides.find(s => s.index === session.slide && !s.skipQuestions), `slide=${session.slide}`);
+
+  if (currentQuestion.choices) {
+    const correctIndex = currentQuestion.choices.findIndex(c => c.correct);
+    const liveList = await until(() => q(`.choices[data-question-id="${currentQuestion.id}"]`), { timeout: 8000 });
+    check('the live question renders its options', !!liveList, currentQuestion.id);
+    const buttons = liveList ? [...liveList.querySelectorAll('button')] : [];
+    check('choice list renders every option', buttons.length === currentQuestion.choices.length, `${buttons.length}/${currentQuestion.choices.length}`);
+    check('choice letters are used', buttons.every((b, i) => text(b.querySelector('.letter')) === 'ABCDEFGH'[i]));
+    check('options start enabled', buttons.every(b => !b.disabled));
+    buttons[correctIndex].click();
+    const graded = await until(() => session.stats.correct >= 1, { timeout: 10000 });
+    check('clicking the right option is graded correct', graded, JSON.stringify(session.stats));
+    check('feedback arrives with a positive tone', await until(() => qa('.msg.tone-good').length >= 1, { timeout: 8000 }), `${qa('.msg.tone-good').length} good-tone messages`);
+    check('a new question follows the feedback or the slide summary', await until(() => session.awaiting === 'answer' || /Slide \d+ done/.test(bodyText()), { timeout: 8000 }));
+    const staleLists = qa('.choices').filter(l => l.dataset.questionId !== session.current?.id);
+    await until(() => win.CyzieApp.state.busy === false, { timeout: 12000 });
+    check('answered option lists are locked', staleLists.every(l => [...l.querySelectorAll('button')].every(b => b.disabled)), `${staleLists.length} stale lists`);
+  } else {
+    const correctAnswer = currentQuestion.answer.text;
+    q('#input').value = correctAnswer;
+    q('#composer').dispatchEvent(new win.Event('submit', { bubbles: true, cancelable: true }));
+    const graded = await until(() => session.stats.correct >= 1, { timeout: 10000 });
+    check('typing the right answer is graded correct', graded, JSON.stringify(session.stats));
+  }
+  check('user message appears in the transcript', qa('.msg.user').length >= 1, `${qa('.msg.user').length} user messages`);
+
+  /* ------------------------------------------------- 4. typed command --- */
+  async function say(line) {
+    await until(() => win.CyzieApp.state.busy === false, { timeout: 15000 });
+    const userBefore = qa('.msg.user').length;
+    const input = q('#input');
+    input.value = line;
+    q('#composer').dispatchEvent(new win.Event('submit', { bubbles: true, cancelable: true }));
+    const accepted = await until(() => qa('.msg.user').length > userBefore, { timeout: 8000 });
+    check(`message "${line.slice(0, 28)}" is accepted`, accepted, 'the outbox dropped it');
+    await until(() => win.CyzieApp.state.busy === false, { timeout: 15000 });
+    await wait(60);
+  }
+
+  const classify = (line) => win.CyzieApp.tutor.classify(win.CyzieApp.state.lesson.session, line);
+  check('classifier reads "help" as the help command', classify('help').intent === 'help', JSON.stringify(classify('help')));
+  check('classifier reads "go to slide 3" as a jump', classify('go to slide 3').intent === 'jump' && classify('go to slide 3').slide === 3, JSON.stringify(classify('go to slide 3')));
+  check('classifier reads a question as a question', classify('what is spaced repetition?').intent === 'define', JSON.stringify(classify('what is spaced repetition?')));
+
+  const beforeHelp = cyzieMessages().length;
+  await say('help');
+  const lastMsg = () => win.CyzieApp.state.lesson.messages.filter(m => m.role === 'cyzie').slice(-1)[0]?.text || '';
+  check('"help" gets a command list', /Things you can say/i.test(bodyText()), `intent=${win.CyzieApp.state.lesson.session.lastIntent} last="${lastMsg().slice(0, 80)}"`);
+  check('"help" added messages', cyzieMessages().length > beforeHelp, `${cyzieMessages().length} vs ${beforeHelp}`);
+
+  await say('glossary');
+  check('"glossary" lists terms from the deck', /Glossary —/.test(bodyText()), bodyText().slice(-200));
+
+  await say('go to slide 3');
+  const moved = await until(() => win.CyzieApp.state.lesson.session.slide === 3, { timeout: 12000 });
+  check('"go to slide 3" moves the lesson', moved, `slide=${win.CyzieApp.state.lesson.session.slide}`);
+  check('header follows the jump', /Slide 3 of/.test(text(q('#slideIndicator'))), text(q('#slideIndicator')));
+
+  await say('hint');
+  check('"hint" responds with a hint', /not |leaves|starts with|Check the wording|Work these|items|Look again/i.test(bodyText().slice(-500)), bodyText().slice(-160));
+
+  await say('show answer');
+  check('"show answer" reveals the slide answer', /slide 3|Slide 3/.test(bodyText().slice(-700)), bodyText().slice(-200));
+
+  await say('summarise this slide');
+  check('"summarise this slide" produces a slide summary', /Slide 3|Key|summary|done/i.test(bodyText().slice(-800)));
+
+  await say('what does spaced repetition mean?');
+  const cited = await until(() => /Slide \d/.test(bodyText().slice(-900)) && /spaced repetition/i.test(bodyText().slice(-900)), { timeout: 10000 });
+  check('a content question is answered with a slide citation', cited, bodyText().slice(-260));
+
+  await say('what is the capital of a country that is not in this deck?');
+  check('an off-deck question is refused honestly', /could not find|not in this lesson/i.test(bodyText().slice(-900)), bodyText().slice(-220));
+
+  await say('explain that simpler');
+  check('"explain that simpler" responds', /plainer|apart|unclear|smaller|simpler|pieces/i.test(bodyText().slice(-900)), bodyText().slice(-180));
+
+  await say('progress');
+  check('"progress" reports a score', /Progress —/.test(bodyText().slice(-900)), '');
+
+  await say('nonsense words that mean nothing at all zzzz');
+  check('gibberish gets a graceful reply', cyzieMessages().length > 0 && !/undefined|NaN/.test(bodyText().slice(-400)), bodyText().slice(-140));
+
+  /* ----------------------------------------------------- 5. context pane --- */
+  check('context pane titles the current slide', text(q('#slideCardTitle')).length > 4, text(q('#slideCardTitle')));
+  check('context pane lists slide text', qa('#slideText .line').length > 0, `${qa('#slideText .line').length} lines`);
+  check('context pane lists key terms', qa('#termList li').length > 0, `${qa('#termList li').length} terms`);
+  check('context pane shows question dots', qa('#qdots .qdot').length > 0, `${qa('#qdots .qdot').length} dots`);
+  check('slide strip has one tick per slide', qa('#slideStrip .slide-tick').length === win.CyzieApp.state.lesson.deck.slides.length, `${qa('#slideStrip .slide-tick').length}`);
+  check('slide strip marks the current slide', qa('#slideStrip .slide-tick.current').length === 1);
+  check('progress bar has advanced', parseFloat(q('#progressFill').style.width) > 0, q('#progressFill').style.width);
+
+  /* --------------------------------------------------- 6. no junk text --- */
+  const junk = /\[object Object\]|undefined|NaN|{{|}}|\bnull\b/;
+  const offenders = qa('.msg .body, .msg .bubble').map(text).filter(t => junk.test(t));
+  check('no template junk leaked into messages', offenders.length === 0, offenders[0]?.slice(0, 120));
+
+  /* --------------------------------------------------- 7. question audit --- */
+  const questionMessages = win.CyzieApp.state.lesson.messages.filter(m => m.kind === 'question');
+  check('question messages carry ids and slides', questionMessages.every(m => m.questionId && m.slide), JSON.stringify(questionMessages[0] || {}));
+  const allQuestions = win.CyzieApp.state.lesson.session.plan.flatMap(p => p.questions);
+  check('every planned question has an answer', allQuestions.every(x => x.answer && x.answer.text), `${allQuestions.length} questions`);
+  check('every question cites a real slide', allQuestions.every(x => win.CyzieApp.state.lesson.deck.slides.some(s => s.index === x.slide)));
+  check('MCQ options are unique and single-answer', allQuestions.filter(x => x.choices).every(x => {
+    const l = x.choices.map(c => c.text.toLowerCase());
+    return new Set(l).size === l.length && x.choices.filter(c => c.correct).length === 1 && x.choices.length >= 3;
+  }), `${allQuestions.filter(x => x.choices).length} MCQ`);
+
+  /* --------------------------------------------------- 7. question audit --- */
+  const sheet = win.CyzieApp.buildStudySheet(win.CyzieApp.state.lesson);
+  check('study sheet builds from the lesson', sheet.length > 200, `${sheet.length} chars`);
+  check('study sheet names the deck', sheet.includes('# ') && /Active Recall|Sample Lesson/.test(sheet), sheet.split('\n')[0]);
+  check('study sheet contains a glossary', /## Glossary/.test(sheet), sheet.slice(0, 120));
+  check('study sheet contains per-slide notes', /## Slide by slide/.test(sheet) && /### Slide 2/.test(sheet));
+  check('study sheet records the session result', /## Your session/.test(sheet) && /questions answered/.test(sheet));
+  check('study sheet has no template junk', !/undefined|NaN|\[object Object\]/.test(sheet), (sheet.match(/undefined|NaN/) || [''])[0]);
+
+  /* ---------------------------------------------------- 8. persistence --- */
+  const lessonId = win.CyzieApp.state.lesson.id;
+  const savedCount = await until(async () => {
+    const list = win.CyzieApp.state.lessons;
+    return list.length >= 1 ? list.length : null;
+  }, { timeout: 8000 });
+  check('lesson appears in the sidebar library', savedCount >= 1, `${savedCount}`);
+  check('sidebar shows the lesson name', /Sample lesson/.test(text(q('#lessonList'))), text(q('#lessonList')).slice(0, 80));
+
+  // Let the deferred save land, then confirm it wrote the transcript before reloading.
+  await wait(2200);
+  const stored = await readStoredTranscript(lessonId);
+  check('transcript is written to local storage', (stored?.messages?.length || 0) > 3, `${stored?.messages?.length} messages stored`);
+  check('session snapshot is written to local storage', !!stored?.session && stored.session.slide >= 1, JSON.stringify(stored?.session?.stats));
+
+  await loadFrame('../index.html?instant=1');
+  await boot();
+  const restored = await until(() => frame.contentWindow.CyzieApp.state.lesson?.id === lessonId, { timeout: 15000 });
+  check('reopening the app restores the last lesson', restored, frame.contentWindow.CyzieApp.state.lesson?.id);
+  const doc2 = frame.contentWindow.document;
+  const msgs2 = [...doc2.querySelectorAll('.msg')];
+  check('transcript is restored after reload', msgs2.length > 4, `${msgs2.length} messages`);
+  const session2 = frame.contentWindow.CyzieApp.state.lesson.session;
+  check('restored session keeps its progress', session2.stats.answered >= 1, JSON.stringify(session2.stats));
+  check('restored session keeps the slide position', session2.slide === 3, `slide=${session2.slide}`);
+  check('restored session still accepts input', session2.awaiting === 'answer' || session2.phase !== 'done', `${session2.awaiting}/${session2.phase}`);
+  check('restored transcript shows the slide Cyzie taught', /Spaced Repetition|Slide 3/.test(doc2.body.textContent), doc2.body.textContent.slice(-160));
+
+  /* ------------------------------------------------ 9. real upload paths --- */
+  const win2 = frame.contentWindow;
+  const doc3 = win2.document;
+  const mdText = await (await fetch('../tests/fixtures/sample-notes.md')).text();
+  const mdFile = new win2.File([mdText], 'sample-notes.md', { type: 'text/markdown' });
+  win2.CyzieApp.ingestFile(mdFile);
+  const mdLesson = await until(() => {
+    const l = win2.CyzieApp.state.lesson;
+    return l?.fileName === 'sample-notes.md' ? l : null;
+  }, { timeout: 15000 });
+  check('markdown upload builds a lesson', !!mdLesson, win2.CyzieApp.state.lesson?.name);
+  check('markdown lesson has sections', (mdLesson?.deck?.slides.length || 0) >= 2, `${mdLesson?.deck?.slides.length} sections`);
+  check('markdown lesson produced a question', (mdLesson?.deck?.stats.questions || 0) > 0, JSON.stringify(mdLesson?.deck?.stats));
+  check('markdown upload is listed in the sidebar', [...doc3.querySelectorAll('#lessonList .li-name')].some(n => /sample-notes/.test(n.textContent)), doc3.querySelector('#lessonList')?.textContent.slice(0, 90));
+
+  const pptxBuf = await (await fetch('../tests/fixtures/sample.pptx')).arrayBuffer();
+  const pptxFile = new win2.File([pptxBuf], 'sample.pptx', { type: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' });
+  win2.CyzieApp.ingestFile(pptxFile);
+  const pptxLesson = await until(() => {
+    const l = win2.CyzieApp.state.lesson;
+    return l?.fileName === 'sample.pptx' ? l : null;
+  }, { timeout: 20000 });
+  check('.pptx upload builds a lesson', !!pptxLesson, win2.CyzieApp.state.lesson?.name);
+  check('.pptx lesson found all 3 slides', pptxLesson?.deck?.slides.length === 3, `${pptxLesson?.deck?.slides.length}`);
+  check('.pptx lesson mined definitions', (pptxLesson?.deck?.stats.termsWithDefs || 0) >= 4, JSON.stringify(pptxLesson?.deck?.stats));
+  check('.pptx lesson found speaker notes', (pptxLesson?.deck?.slides[0].notes || '').length > 10, pptxLesson?.deck?.slides[0].notes?.slice(0, 60));
+  check('.pptx lesson avoids code-like terms', ![...(pptxLesson?.deck?.glossary.values() || [])].some(t => /[{};]/.test(t.term)));
+  const pptxQ = await until(() => win2.CyzieApp.state.lesson?.session?.current, { timeout: 12000 });
+  check('.pptx lesson asks a question straight away', !!pptxQ, JSON.stringify(win2.CyzieApp.state.lesson?.session?.current?.type));
+  const paneReady = await until(() => doc3.querySelectorAll('#slideText .line').length > 0, { timeout: 10000 });
+  check('.pptx lesson shows its slides in the context pane', paneReady, `${doc3.querySelectorAll('#slideText .line').length} lines`);
+  const paneTitle = await until(() => /Binary|Data Representation/i.test(text(doc3.querySelector('#slideCardTitle'))), { timeout: 10000 });
+  check('.pptx context pane shows the slide title', paneTitle, text(doc3.querySelector('#slideCardTitle')));
+  const paneTerms = await until(() => [...doc3.querySelectorAll('#termList .t-name')].some(n => /bit|byte|data/i.test(n.textContent)), { timeout: 10000 });
+  check('.pptx context pane lists mined terms', paneTerms, [...doc3.querySelectorAll('#termList .t-name')].map(n => n.textContent).join(','));
+
+  const badFile = new win2.File(['hello'], 'notes.rtf', { type: 'application/rtf' });
+  win2.CyzieApp.ingestFile(badFile);
+  check('an unsupported file type is rejected with an explanation', /Cyzie reads/i.test(text(doc3.querySelector('.notice'))), text(doc3.querySelector('.notice')).slice(0, 120));
+
+  /* ---------------------------------------------- 9b. pdf upload path --- */
+  const pdfBuf = await (await fetch('../tests/fixtures/sample.pdf')).arrayBuffer();
+  const pdfFile = new win2.File([pdfBuf], 'sample.pdf', { type: 'application/pdf' });
+  win2.CyzieApp.ingestFile(pdfFile);
+  const pdfLesson = await until(() => {
+    const l = win2.CyzieApp.state.lesson;
+    return l?.fileName === 'sample.pdf' ? l : null;
+  }, { timeout: 25000 });
+  check('.pdf upload builds a lesson', !!pdfLesson, win2.CyzieApp.state.lesson?.name);
+  check('.pdf lesson found both pages', pdfLesson?.deck?.slides.length === 2, `${pdfLesson?.deck?.slides.length}`);
+  check('.pdf lesson read the page text', (pdfLesson?.deck?.slides[0].lines.length || 0) >= 4, `${pdfLesson?.deck?.slides[0].lines.length} lines`);
+  check('.pdf page title was detected', /Bits and Bytes/i.test(pdfLesson?.deck?.slides[0].title || ''), pdfLesson?.deck?.slides[0].title);
+  check('.pdf lesson mined definitions', (pdfLesson?.deck?.stats.termsWithDefs || 0) >= 3, JSON.stringify(pdfLesson?.deck?.stats));
+  const pdfPaneTitle = await until(() => /Bits and Bytes/i.test(text(doc3.querySelector('#slideCardTitle'))), { timeout: 15000 });
+  check('.pdf context pane follows the uploaded file', pdfPaneTitle, text(doc3.querySelector('#slideCardTitle')));
+  const rendered = await until(() => {
+    const img = doc3.querySelector('#slideCanvasWrap img');
+    return img && img.src.startsWith('data:image/') ? img : null;
+  }, { timeout: 25000 });
+  check('.pdf page is rendered as an image in the slide pane', !!rendered, rendered ? rendered.src.slice(0, 24) : 'no canvas image');
+  check('.pdf page image has real dimensions', rendered ? (rendered.naturalWidth > 200 || rendered.width > 200) : false, rendered ? `${rendered.naturalWidth}×${rendered.naturalHeight}` : '');
+  const pdfQuestion = await until(() => win2.CyzieApp.state.lesson?.session?.current, { timeout: 15000 });
+  check('.pdf lesson asks a question', !!pdfQuestion, JSON.stringify(win2.CyzieApp.state.lesson?.session?.current?.type));
+  check('.pdf lesson is listed in the sidebar', [...doc3.querySelectorAll('#lessonList .li-name')].some(n => /sample\b/i.test(n.textContent) || /sample/.test(n.textContent)), doc3.querySelector('#lessonList')?.textContent.slice(0, 120));
+
+  /* -------------------------------------------------- 10. streaming mode --- */
+  await loadFrame('../index.html?stream=1');
+  await boot();
+  const win3 = frame.contentWindow;
+  const doc4 = win3.document;
+  await until(() => doc4.querySelectorAll('.msg').length > 1, { timeout: 20000 });
+  const beforeStream = doc4.querySelectorAll('.msg.cyzie').length;
+  win3.CyzieApp.send('help');                       // a real turn, so the reply streams
+  const cursorSeen = await until(() => !!doc4.querySelector('.cursor'), { timeout: 10000 });
+  check('streaming mode renders a typing cursor', cursorSeen, `${doc4.querySelectorAll('.msg').length} messages in flight`);
+  const settled = await until(() => !doc4.querySelector('.cursor') && doc4.querySelectorAll('.msg.cyzie').length > beforeStream, { timeout: 25000 });
+  check('streaming settles into formatted messages', settled, `${doc4.querySelectorAll('.msg.cyzie').length} cyzie messages`);
+  check('streamed markdown renders bold text', !!doc4.querySelector('.msg .body strong'));
+  check('streamed reply keeps its action row', doc4.querySelectorAll('.msg .msg-foot button').length > 0);
+
+  /* ----------------------------------------------------- 11. responsive --- */
+  await loadFrame('../index.html?instant=1');
+  await boot();
+  await until(() => frame.contentWindow.document.querySelector('.msg'), { timeout: 12000 });
+  frame.style.width = '390px';
+  frame.style.height = '780px';
+  await wait(700);
+  const d = frame.contentWindow.document;
+  const overflow = d.documentElement.scrollWidth - d.documentElement.clientWidth;
+  // Layout metrics (offsetWidth/clientWidth) rather than rects: the preview pane may scale the page.
+  const vw = d.documentElement.clientWidth;
+  const composerEl = d.querySelector('#composer');
+  const inputEl = d.querySelector('#input');
+  const buttonEl = d.querySelector('#sendBtn');
+  const inputW = inputEl.offsetWidth;
+  const composerW = composerEl.offsetWidth;
+  const buttonRight = buttonEl.offsetLeft + buttonEl.offsetWidth;
+  const widestReply = Math.max(0, ...[...d.querySelectorAll('.msg .body, .msg .bubble')].map(n => n.offsetLeft + n.offsetWidth));
+  check('viewport is actually narrow', vw <= 400, `clientWidth=${vw}`);
+  check('no horizontal overflow at 390px width', overflow <= 4, `overflow ${overflow}px at ${vw}px`);
+  check('composer keeps a usable typing area at 390px', inputW > 150, `input ${inputW}px, composer ${composerW}px, viewport ${vw}px`);
+  check('send button stays on screen at 390px', buttonRight <= vw + 1 && buttonEl.offsetWidth > 20, `right=${buttonRight} width=${buttonEl.offsetWidth}`);
+  check('reply text stays inside the viewport at 390px', widestReply <= vw + 1, `widest=${widestReply}`);
+  frame.style.width = '1280px';
+  frame.style.height = '720px';
+  await wait(500);
+  // Layout sanity at desktop size: the column must fit the frame and the transcript must scroll.
+  const main = d.querySelector('.main');
+  const chat = d.querySelector('.chat');
+  const composerBottom = d.querySelector('.composer-wrap').offsetTop + d.querySelector('.composer-wrap').offsetHeight;
+  check('the main column fits the viewport height', main.offsetHeight <= 722, `main=${main.offsetHeight}px`);
+  check('the chat area scrolls instead of stretching', chat.offsetHeight <= 722, `chat=${chat.offsetHeight}px`);
+  check('the chat pane owns the scrolling', getComputedStyle(chat).overflowY === 'auto' && chat.offsetHeight <= 722, `overflowY=${getComputedStyle(chat).overflowY} height=${chat.offsetHeight}`);
+  check('the transcript has room or scrolls', chat.scrollHeight >= chat.clientHeight, `scrollHeight=${chat.scrollHeight} clientHeight=${chat.clientHeight}`);
+  check('the composer stays inside the window', composerBottom <= 722, `bottom=${composerBottom}px`);
+  check('side panes fit the viewport height', d.querySelector('.sidebar').offsetHeight <= 722, `${d.querySelector('.sidebar').offsetHeight}px`);
+
+  /* ------------------------------------------------------ 12. console --- */
+  check('no console errors during the whole run', consoleErrors.length === 0, consoleErrors.slice(0, 2).join(' | '));
+
+  finish();
+}
+
+function finish() {
+  const failed = results.filter(r => !r.ok);
+  summary.textContent = `${results.length - failed.length}/${results.length} checks passed`
+    + (failed.length ? ` — ${failed.length} FAILED: ${failed.map(f => `${f.name}«${f.detail || ''}»`).join(' | ')}` : ' — all good');
+  summary.style.color = failed.length ? '#a13a2c' : '#14715c';
+  document.title = failed.length ? `FAIL ${failed.length}/${results.length}` : `PASS ${results.length}/${results.length}`;
+  window.__cyzieSelfTest = { total: results.length, failed: failed.map(f => f.name), detail: results };
+  console.log(JSON.stringify(window.__cyzieSelfTest));
+}
+
+run().then(() => {},
+  err => {
+    report(`harness crashed: ${err.message}`, false, err.stack?.slice(0, 400));
+    finish();
+  });
+// Hard stop: never leave the page hanging if a step wedges.
+setTimeout(() => {
+  if (!document.title.startsWith('PASS') && !document.title.startsWith('FAIL')) {
+    report('harness exceeded its time budget', false, `${results.length} checks reported so far`);
+    finish();
+  }
+}, 240000);
+</script>
+</body>
+</html>

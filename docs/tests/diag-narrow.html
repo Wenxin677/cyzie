@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Cyzie narrow-viewport diagnostics</title>
+<style>body{font:12.5px/1.45 Consolas,monospace;padding:14px} pre{white-space:pre-wrap} iframe{width:390px;height:760px;border:1px solid #999;display:block;margin-top:8px}</style>
+</head>
+<body>
+<h1>narrow-viewport diagnostics (iframe = 390px)</h1>
+<pre id="out">measuring…</pre>
+<iframe id="f" src="../index.html?instant=1&narrow=1" title="app at 390px"></iframe>
+<script type="module">
+const out = document.getElementById('out');
+const frame = document.getElementById('f');
+const wait = ms => new Promise(r => setTimeout(r, ms));
+await wait(3500);
+try {
+  frame.contentWindow.CyzieApp?.loadSample();
+  await wait(3500);
+} catch (e) { out.textContent = `app not ready: ${e.message}`; }
+
+const d = frame.contentWindow.document;
+const w = frame.contentWindow;
+const g = el => { const n = d.querySelector(el); if (!n) return `${el}: MISSING`; const r = n.getBoundingClientRect(); const cs = getComputedStyle(n); return `${el}: offset=${n.offsetWidth} rect=${Math.round(r.width)}x${Math.round(r.height)} left=${Math.round(r.left)} display=${cs.display} pos=${cs.position}`; };
+const lines = [
+  `innerWidth=${w.innerWidth} clientWidth=${d.documentElement.clientWidth} scrollWidth=${d.documentElement.scrollWidth}`,
+  `body.class="${d.body.className}"`,
+  g('.app'), g('.sidebar'), g('.main'), g('.topbar'), g('.chat'), g('.composer-wrap'), g('.chips'), g('#composer'), g('#input'), g('#sendBtn'), g('.context'),
+  `grid-template-columns = "${getComputedStyle(d.querySelector('.app')).gridTemplateColumns}"`,
+  `media (max-width:860px) matches = ${w.matchMedia('(max-width: 860px)').matches}`,
+  `media (max-width:1180px) matches = ${w.matchMedia('(max-width: 1180px)').matches}`,
+  `messages rendered = ${d.querySelectorAll('.msg').length}`,
+  `widest message right = ${Math.max(0, ...[...d.querySelectorAll('.msg .body, .msg .bubble')].map(n => n.offsetLeft + n.offsetWidth))}`,
+];
+out.textContent = lines.join('\n');
+document.title = 'NARROW DIAG';
+</script>
+</body>
+</html>

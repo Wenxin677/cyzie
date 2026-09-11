@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Cyzie module diagnostics</title>
+<style>body{font:13px/1.5 Consolas,monospace;padding:16px} .ok{color:#14715c} .bad{color:#a13a2c;font-weight:700}</style>
+</head>
+<body>
+<h1>Cyzie module diagnostics</h1>
+<pre id="out">running…</pre>
+<script type="module">
+const out = document.getElementById('out');
+const lines = [];
+const log = (ok, name, detail = '') => { lines.push(`${ok ? 'OK  ' : 'FAIL'} ${name}${detail ? ' :: ' + detail : ''}`); out.textContent = lines.join('\n'); };
+
+window.addEventListener('error', e => log(false, 'window error', e.message));
+window.addEventListener('unhandledrejection', e => log(false, 'unhandled rejection', e.reason?.message || String(e.reason)));
+
+const modules = [
+  'js/nlp.js', 'js/zip.js', 'js/parse-pptx.js', 'js/parse-pdf.js', 'js/parse-text.js',
+  'js/extract.js', 'js/questions.js', 'js/grade.js', 'js/retrieve.js', 'js/tutor.js',
+  'js/markdown.js', 'js/store.js', 'js/sample.js',
+];
+const loaded = {};
+for (const m of modules) {
+  try {
+    loaded[m] = await import(`../${m}?diag=${Date.now()}`);
+    log(true, m);
+  } catch (err) {
+    log(false, m, `${err.name}: ${err.message}`);
+  }
+}
+
+try {
+  const { parseText } = loaded['js/parse-text.js'];
+  const { analyzeDeck } = loaded['js/extract.js'];
+  const { createSession, start, respond } = loaded['js/tutor.js'];
+  const deck = analyzeDeck(parseText('# A\n\nBit: a single binary digit, zero or one.\n\n# B\n\nByte: eight bits of data in a row.\n'));
+  const session = createSession(deck, { seed: 'diag' });
+  const out1 = start(session);
+  log(true, 'tutor runs in the browser', `${out1.messages.length} messages, awaiting=${session.awaiting}`);
+  const out2 = respond(session, 'next');
+  log(true, 'tutor advanced a slide', `slide=${session.slide}, ${out2.messages.length} messages`);
+} catch (err) {
+  log(false, 'tutor smoke test', `${err.name}: ${err.message}`);
+}
+
+try {
+  const { openZip } = loaded['js/zip.js'];
+  const res = await fetch('../tests/fixtures/sample.pptx');
+  const buf = await res.arrayBuffer();
+  const zip = await openZip(buf);
+  log(zip.names.length > 5, 'zip reader opens the .pptx fixture', `${zip.names.length} entries`);
+  const { parsePptx } = loaded['js/parse-pptx.js'];
+  const parsed = await parsePptx(buf);
+  log(parsed.slides.length === 3, 'pptx parser reads the fixture', `${parsed.slides.length} slides`);
+} catch (err) {
+  log(false, 'pptx parse in browser', `${err.name}: ${err.message}`);
+}
+
+try {
+  const res = await fetch('../tests/fixtures/../fixtures/sample-notes.md');
+  const t = await res.text();
+  log(t.length > 50, 'fixture files are served', `${t.length} chars`);
+} catch (err) {
+  log(false, 'fixture fetch', `${err.name}: ${err.message}`);
+}
+
+try {
+  const { openDb } = loaded['js/store.js'];
+  const db = await openDb();
+  log(!!db, 'IndexedDB opens', [...db.objectStoreNames].join(','));
+} catch (err) {
+  log(false, 'IndexedDB', `${err.name}: ${err.message}`);
+}
+
+// Report what the app itself says when loaded in an iframe.
+const frame = document.createElement('iframe');
+frame.style.cssText = 'width:1100px;height:520px;border:1px solid #999;margin-top:10px';
+frame.src = `../index.html?instant=1&diag=${Date.now()}`;
+document.body.appendChild(frame);
+await new Promise(r => setTimeout(r, 4000));
+try {
+  const w = frame.contentWindow;
+  const hasApp = !!w.CyzieApp?.state;
+  log(hasApp, 'index.html boots and exposes CyzieApp');
+  if (!hasApp) {
+    log(false, 'app body text', (w.document.body.innerText || '').slice(0, 500).replace(/\n+/g, ' | '));
+  } else {
+    log(true, 'app state', `lessons=${w.CyzieApp.state.lessons.length} lesson=${w.CyzieApp.state.lesson?.name || 'none'}`);
+    const f2 = document.createElement('iframe');
+    f2.style.cssText = 'width:1100px;height:520px;border:1px solid #999;margin-top:10px';
+    f2.src = `../index.html?stream=1&diag2=${Date.now()}`;
+    document.body.appendChild(f2);
+    await new Promise(r => setTimeout(r, 3000));
+    const w2 = f2.contentWindow;
+    log(!!w2.CyzieApp?.state, 'app also boots with the streaming flag');
+    w2.CyzieApp?.loadSample();
+    await new Promise(r => setTimeout(r, 3500));
+    log(w2.document.querySelectorAll('.msg').length > 2, 'sample lesson renders in the browser', `${w2.document.querySelectorAll('.msg').length} messages`);
+  }
+} catch (err) {
+  log(false, 'iframe app boot', `${err.name}: ${err.message}`);
+}
+
+document.title = lines.some(l => l.startsWith('FAIL')) ? 'DIAG FAIL' : 'DIAG OK';
+</script>
+</body>
+</html>

@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cyzie — slide-by-slide tutor</title>
+<meta name="description" content="Cyzie reads your lecture slides and teaches them back to you, one page at a time, with questions — entirely inside your browser.">
+<link rel="stylesheet" href="css/app.css?v=4">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%231f6f5c'/%3E%3Ctext x='16' y='23' font-family='Georgia,serif' font-size='20' fill='%23fff' text-anchor='middle'%3EC%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar" id="sidebar" aria-label="Lessons">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">C</div>
+      <div>
+        <span class="brand-name">Cyzie</span>
+        <span class="brand-tag">slide-by-slide tutor</span>
+      </div>
+    </div>
+
+    <button class="new-lesson" id="newLessonBtn" type="button">
+      <span aria-hidden="true">＋</span> New lesson
+    </button>
+
+    <nav class="library" aria-label="Your lessons">
+      <h2 class="side-head">Your lessons</h2>
+      <ul id="lessonList" style="list-style:none;margin:0;padding:0;display:grid;gap:2px;"></ul>
+      <p class="side-empty" id="libraryEmpty">No lessons yet. Upload a PDF or PowerPoint and Cyzie will build the lesson from it.</p>
+    </nav>
+
+    <div class="side-foot">
+      <div class="side-actions">
+        <button type="button" data-role="settings">Settings</button>
+        <button type="button" data-role="theme">Dark mode</button>
+        <button type="button" data-role="clear">Clear data</button>
+      </div>
+      <p class="privacy">Your files are read inside this browser. Nothing is uploaded, and nothing is sent to a server.</p>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <button class="icon-btn" id="menuBtn" type="button" aria-label="Show lessons">☰</button>
+      <div class="topbar-meta">
+        <h1 id="lessonTitle">No lesson loaded</h1>
+        <div class="topbar-sub">
+          <span id="slideIndicator">Sample lesson</span>
+          <span id="progressText"></span>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <button class="icon-btn" id="prevSlideBtn" type="button" aria-label="Previous slide" title="Previous slide">‹</button>
+        <button class="icon-btn" id="nextSlideBtn" type="button" aria-label="Next slide" title="Next slide">›</button>
+        <button class="icon-btn" id="panelBtn" type="button" aria-label="Toggle slide panel" title="Slide panel">Slide</button>
+        <button class="icon-btn" id="themeBtn" type="button" aria-label="Toggle theme" title="Light / dark">◐</button>
+      </div>
+      <div class="progress-track" aria-hidden="true"><div class="progress-fill" id="progressFill"></div></div>
+    </header>
+
+    <section class="chat" id="chat" aria-label="Conversation">
+      <div class="chat-inner">
+        <div class="empty-state" id="emptyState">
+          <h2>Cyzie</h2>
+          <p class="lede">Upload a lesson file. Cyzie reads every slide, teaches them to you one at a time, questions you on each one, and answers whatever you ask — straight from your file.</p>
+          <div class="dropzone" id="dropzone">
+            <div>
+              <div class="dz-title">Drop slides here</div>
+              <div class="dz-sub">PowerPoint (.pptx), PDF, Word (.docx), or plain text / markdown. Read locally — the file never leaves your device.</div>
+            </div>
+            <div class="dz-actions">
+              <button class="btn-primary" id="pickFileBtn" type="button">Choose a file</button>
+              <button class="btn-secondary" id="sampleBtn" type="button">Try the sample lesson</button>
+            </div>
+          </div>
+          <ul class="facts">
+            <li><strong>One slide at a time</strong>Cyzie explains the page, then asks you about it. You can ask anything back at any moment.</li>
+            <li><strong>Questions from your slides</strong>Multiple choice, fill-in-the-blank, true/false and open recall — all generated from the words on the page.</li>
+            <li><strong>Answers with citations</strong>Every reply points to the slide it came from. If the deck does not cover something, Cyzie says so.</li>
+          </ul>
+        </div>
+        <ol class="messages" id="messages"></ol>
+      </div>
+    </section>
+
+    <footer class="composer-wrap">
+      <div class="chips" id="chips"></div>
+      <form class="composer" id="composer" autocomplete="off">
+        <textarea id="input" rows="1" placeholder="Answer Cyzie, or ask anything about this deck…" aria-label="Message Cyzie"></textarea>
+        <button type="submit" id="sendBtn" aria-label="Send message">↑</button>
+      </form>
+      <p class="composer-hint">Enter to send · Shift+Enter for a new line · type <strong>help</strong> for every command</p>
+    </footer>
+  </main>
+
+  <aside class="context" id="context" aria-label="Slide detail">
+    <div class="context-inner" id="contextInner">
+      <h2>Current slide</h2>
+      <div class="slide-card" id="slideCard">
+        <header><strong id="slideCardTitle">—</strong><span id="slideCardNum"></span></header>
+        <div class="slide-canvas-wrap" id="slideCanvasWrap" hidden></div>
+        <div class="slide-text" id="slideText"></div>
+      </div>
+      <h2>Questions on this slide</h2>
+      <div class="qdots" id="qdots"></div>
+      <h2>Key terms here</h2>
+      <ul class="term-list" id="termList"></ul>
+      <h2>Jump to a slide</h2>
+      <div class="slide-strip" id="slideStrip"></div>
+    </div>
+  </aside>
+</div>
+
+<div class="scrim" id="scrim"></div>
+<div class="drop-overlay" id="dropOverlay">Drop the file to build a lesson</div>
+
+<div class="modal" id="settingsModal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+  <div class="modal-card">
+    <h2 id="settingsTitle">Settings</h2>
+    <p class="hint">Saved in this browser only.</p>
+    <div class="field">
+      <label for="setName">What should Cyzie call you?</label>
+      <input id="setName" type="text" placeholder="Optional" maxlength="24">
+    </div>
+    <div class="field">
+      <label for="setDensity">Questions per slide</label>
+      <select id="setDensity">
+        <option value="quick">Quick — 3 per slide</option>
+        <option value="standard">Standard — 5 per slide</option>
+        <option value="deep">Thorough — 7 per slide</option>
+      </select>
+    </div>
+    <div class="modal-actions">
+      <button class="btn-secondary" type="button" data-close="settingsModal">Close</button>
+      <button class="btn-primary" type="button" id="saveSettingsBtn">Save</button>
+    </div>
+  </div>
+</div>
+
+<input type="file" id="fileInput" accept=".pdf,.pptx,.docx,.txt,.md,.markdown" hidden>
+
+<script type="module" src="js/app.js?v=5"></script>
+</body>
+</html>
