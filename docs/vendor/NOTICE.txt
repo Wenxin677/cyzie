@@ -1,0 +1,12 @@
+Bundled third-party code
+========================
+
+docs/vendor/pdf.min.mjs
+docs/vendor/pdf.worker.min.mjs
+    PDF.js — https://github.com/mozilla/pdf.js
+    Copyright 2012 Mozilla Foundation
+    Licensed under the Apache License, Version 2.0
+    http://www.apache.org/licenses/LICENSE-2.0
+    Files taken unmodified from the pdfjs-dist npm package (v4.6.82).
+
+Everything else in this repository is original work.
