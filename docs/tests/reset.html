@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Cyzie data reset</title>
+<link rel="stylesheet" href="../css/app.css">
+<style>body{padding:40px;max-width:640px} .box{border:1px solid var(--line);background:var(--surface);border-radius:var(--radius-lg);padding:22px} h1{font-family:var(--serif);margin:0 0 8px} code{font-family:var(--mono);font-size:12.5px}</style>
+</head>
+<body>
+<div class="box">
+  <h1>Cyzie — local data reset</h1>
+  <p id="status">Clearing lessons, transcripts and settings stored by Cyzie in this browser…</p>
+  <p><a href="../index.html">Open Cyzie</a></p>
+  <p style="color:var(--muted);font-size:13px">This page only deletes data held by Cyzie in <em>this</em> browser profile. Nothing on any server is touched — there is no server.</p>
+</div>
+<script type="module">
+const status = document.getElementById('status');
+try {
+  await new Promise(resolve => {
+    const req = indexedDB.deleteDatabase('cyzie');
+    req.onsuccess = req.onerror = req.onblocked = () => resolve();
+    setTimeout(resolve, 1500);
+  });
+  try { localStorage.removeItem('cyzie:settings'); } catch { /* ignore */ }
+  status.textContent = 'Done. Every lesson, transcript and setting Cyzie stored here has been removed.';
+} catch (err) {
+  status.textContent = `Could not clear the data: ${err.message}`;
+}
+document.title = 'Cyzie data reset — done';
+</script>
+</body>
+</html>
