@@ -3,3 +3,4 @@ tests/fixtures/local/
 *.log
 docs/tests/_local/
 tools/dev/reports/
+screenshots/

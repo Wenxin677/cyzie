@@ -178,6 +178,33 @@ async function run() {
   }
   check('user message appears in the transcript', qa('.msg.user').length >= 1, `${qa('.msg.user').length} user messages`);
 
+  // True/false must offer clickable True and False buttons rather than only accepting typing.
+  let tfQuestion = session.current?.type === 'true_false' ? session.current : null;
+  for (let step = 0; step < 12 && !tfQuestion; step++) {
+    const before = `${session.slide}:${session.current?.id || ''}`;
+    await say(session.awaiting === 'answer' ? 'skip' : 'next');
+    if (session.current?.type === 'true_false') { tfQuestion = session.current; break; }
+    if (`${session.slide}:${session.current?.id || ''}` === before) break;
+  }
+  if (tfQuestion) {
+    // Scope to the live question's list: older lists stay in the transcript, disabled.
+    const tfList = await until(() => q(`.choices[data-question-id="${tfQuestion.id}"]`), { timeout: 6000 });
+    const tfButtons = tfList ? [...tfList.querySelectorAll('button')].filter(b => /^(true|false)$/i.test(b.textContent.trim())) : [];
+    check('true/false offers clickable True and False', tfButtons.length === 2, tfList ? `${tfButtons.length} live buttons` : 'no live option list');
+    const wanted = /true/i.test(tfQuestion.answer.text) ? 'true' : 'false';
+    const target = tfButtons.find(b => b.textContent.trim().toLowerCase() === wanted);
+    const answeredBefore = session.stats.answered;
+    if (target) {
+      target.click();
+      const graded = await until(() => session.stats.answered > answeredBefore || session.awaiting !== 'answer', { timeout: 10000 });
+      check('clicking a true/false button is graded', graded, JSON.stringify(session.stats));
+    } else {
+      check('clicking a true/false button is graded', false, `no "${wanted}" button`);
+    }
+  } else {
+    check('true/false offers clickable True and False', false, 'no true/false question reached in 12 steps');
+  }
+
   /* ------------------------------------------------- 4. typed command --- */
   async function say(line) {
     await until(() => win.CyzieApp.state.busy === false, { timeout: 15000 });

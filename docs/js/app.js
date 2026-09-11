@@ -350,7 +350,9 @@ function choicesList(message) {
     const b = document.createElement('button');
     b.type = 'button';
     b.dataset.choice = String(i);
-    b.innerHTML = `<span class="letter">${letters[i]}</span><span>${renderInline(choice.text)}</span>`;
+    b.innerHTML = wordChoice
+      ? `<span>${renderInline(choice.text)}</span>`
+      : `<span class="letter">${letters[i]}</span><span>${renderInline(choice.text)}</span>`;
     b.addEventListener('click', () => {
       if (state.quizLocked) return;
       // Multiple choice answers accept the letter; true/false reads the word itself.
