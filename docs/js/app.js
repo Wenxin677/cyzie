@@ -278,8 +278,10 @@ async function streamInto(li, message) {
     }
     body.innerHTML = renderMarkdown(text);
   }
+  // Answer options come first; the Hint / Show answer / Skip chips sit under them.
+  const optionButtons = message.kind === 'question' ? choicesList(message) : null;
+  if (optionButtons) body.appendChild(optionButtons);
   body.appendChild(messageFooter(message));
-  if (message.choices && message.choices.length) body.appendChild(choicesList(message));
   if (message.sources && message.sources.length) body.appendChild(sourcesRow(message));
   if (message.card && message.slide) {
     const lesson = state.lesson;
@@ -335,7 +337,15 @@ function choicesList(message) {
   ul.className = 'choices';
   if (message.questionId) ul.dataset.questionId = message.questionId;
   const letters = 'ABCDEFGH';
-  message.choices.forEach((choice, i) => {
+  // True/false has no option list of its own, but two buttons beat typing "true".
+  const synthetic = message.choices && message.choices.length
+    ? message.choices
+    : message.questionType === 'true_false'
+      ? [{ text: 'True' }, { text: 'False' }]
+      : null;
+  if (!synthetic) return null;
+  const wordChoice = !(message.choices && message.choices.length);
+  synthetic.forEach((choice, i) => {
     const li = document.createElement('li');
     const b = document.createElement('button');
     b.type = 'button';
@@ -343,7 +353,8 @@ function choicesList(message) {
     b.innerHTML = `<span class="letter">${letters[i]}</span><span>${renderInline(choice.text)}</span>`;
     b.addEventListener('click', () => {
       if (state.quizLocked) return;
-      send(letters[i]);
+      // Multiple choice answers accept the letter; true/false reads the word itself.
+      send(wordChoice ? choice.text : letters[i]);
     });
     li.appendChild(b);
     ul.appendChild(li);

@@ -156,6 +156,19 @@ async function run() {
     const staleLists = qa('.choices').filter(l => l.dataset.questionId !== session.current?.id);
     await until(() => win.CyzieApp.state.busy === false, { timeout: 12000 });
     check('answered option lists are locked', staleLists.every(l => [...l.querySelectorAll('button')].every(b => b.disabled)), `${staleLists.length} stale lists`);
+  } else if (currentQuestion.type === 'true_false') {
+    // True/false carries no option list of its own; the app offers True / False buttons.
+    const tfButtons = [...doc.querySelectorAll('.choices button')].filter(b => /^(True|False)$/i.test(b.textContent.trim()));
+    check('true/false offers clickable True and False', tfButtons.length === 2, `${tfButtons.length} buttons`);
+    const wanted = currentQuestion.answer.text.toLowerCase() === 'true' ? 'True' : 'False';
+    const btn = tfButtons.find(b => b.textContent.trim().toLowerCase() === wanted.toLowerCase());
+    if (btn) {
+      btn.click();
+      const graded = await until(() => session.stats.answered >= 1, { timeout: 10000 });
+      check('clicking the true/false button is graded', graded, JSON.stringify(session.stats));
+    } else {
+      check('clicking the true/false button is graded', false, `no ${wanted} button`);
+    }
   } else {
     const correctAnswer = currentQuestion.answer.text;
     q('#input').value = correctAnswer;
